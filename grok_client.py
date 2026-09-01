@@ -13,17 +13,48 @@ LOGGER = logging.getLogger(__name__)
 
 IMAGE_API_BASE = "https://api.x.ai/v1"
 DEFAULT_IMAGE_MODEL = "grok-imagine-image"
-DEFAULT_CHAT_MODEL = "grok-3"
+DEFAULT_CHAT_MODEL = "grok-4-1-fast-non-reasoning"
 IMAGE_MODEL_FALLBACKS = (
     "grok-imagine-image",
     "grok-imagine-image-quality",
     "grok-imagine-image-2.0",
 )
 CHAT_MODEL_FALLBACKS = (
+    "grok-4-1-fast-non-reasoning",
+    "grok-4-fast-non-reasoning",
+    "grok-2-1212",
+    "grok-2-vision-1212",
+    "grok-beta",
     "grok-3",
     "grok-3-mini",
-    "grok-2-latest",
 )
+MODELS_LIST_URL = "https://api.x.ai/v1/models"
+
+
+def is_grok_image_model(name: str) -> bool:
+    n = name.lower()
+    if "imagine" in n or "voice" in n:
+        return True
+    return n.startswith("grok-") and "-image" in n and "vision" not in n
+
+
+def normalize_grok_models(chat_model: str, image_model: str) -> tuple[str, str]:
+    chat = (chat_model or "").strip()
+    image = (image_model or "").strip()
+    if chat and is_grok_image_model(chat):
+        LOGGER.warning(
+            "GROK_MODEL=%s — это image-модель, не chat. "
+            "Используйте GROK_IMAGE_MODEL для картинок и GROK_MODEL для текста.",
+            chat,
+        )
+        if not image or image == DEFAULT_IMAGE_MODEL:
+            image = chat
+        chat = DEFAULT_CHAT_MODEL
+    if not chat:
+        chat = DEFAULT_CHAT_MODEL
+    if not image:
+        image = DEFAULT_IMAGE_MODEL
+    return chat, image
 
 
 class GrokClient:
@@ -43,6 +74,8 @@ class GrokClient:
         self.image_api_url = image_api_url or f"{IMAGE_API_BASE}/images/generations"
         self._working_image_model: str | None = None
         self._blocked_image_models: set[str] = set()
+        self._blocked_chat_models: set[str] = set()
+        self._available_chat_models: list[str] | None = None
 
     @property
     def available(self) -> bool:
@@ -73,9 +106,47 @@ class GrokClient:
     def _chat_model_candidates(self) -> list[str]:
         models: list[str] = []
         for name in (self.model, *CHAT_MODEL_FALLBACKS):
-            if name and name not in models:
+            if (
+                name
+                and name not in models
+                and not is_grok_image_model(name)
+                and name not in self._blocked_chat_models
+            ):
                 models.append(name)
+        if self._available_chat_models:
+            known = set(models)
+            for name in self._available_chat_models:
+                if name not in known and name not in self._blocked_chat_models:
+                    models.append(name)
+                    known.add(name)
         return models
+
+    async def refresh_chat_models(self) -> None:
+        if not self.api_key:
+            return
+        try:
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(MODELS_LIST_URL, headers=headers)
+            if response.status_code != 200:
+                return
+            body = response.json()
+            items = body.get("data") if isinstance(body, dict) else None
+            if not isinstance(items, list):
+                return
+            chat_models = [
+                str(item.get("id"))
+                for item in items
+                if isinstance(item, dict)
+                and item.get("id")
+                and not is_grok_image_model(str(item["id"]))
+                and "voice" not in str(item["id"]).lower()
+            ]
+            if chat_models:
+                self._available_chat_models = chat_models
+                LOGGER.info("Grok chat models available: %s", ", ".join(chat_models[:8]))
+        except Exception as exc:
+            LOGGER.debug("Grok models list failed: %s", exc)
 
     async def _chat_completion(
         self,
@@ -85,6 +156,8 @@ class GrokClient:
         temperature: float,
         timeout: float = 120,
     ) -> str:
+        if self._available_chat_models is None:
+            await self.refresh_chat_models()
         last_error = ""
         for model in self._chat_model_candidates():
             payload = {
@@ -98,12 +171,18 @@ class GrokClient:
             )
             if status == 200 and isinstance(body, dict):
                 try:
-                    return body["choices"][0]["message"]["content"].strip()
+                    content = body["choices"][0]["message"]["content"]
+                    if content and str(content).strip():
+                        if model != self.model:
+                            LOGGER.info("Grok chat ok with model %s", model)
+                        return str(content).strip()
                 except (KeyError, IndexError, TypeError) as exc:
                     raise RuntimeError(f"Unexpected Grok response: {body}") from exc
             err = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)[:400]
             last_error = f"HTTP {status} model={model}: {err}"
             LOGGER.warning("Grok chat attempt failed: %s", last_error)
+            if status in (400, 404):
+                self._blocked_chat_models.add(model)
         raise RuntimeError(last_error or "Grok chat failed")
 
     async def answer_text(

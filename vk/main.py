@@ -154,11 +154,13 @@ async def _run_bot(cfg: dict) -> None:
     storage = create_storage(cfg["db_path"])
     grok = GrokClient(
         api_key=cfg.get("grok_api_key") or "",
-        model=cfg.get("grok_model") or "grok-2-latest",
+        model=cfg.get("grok_model") or "grok-4-1-fast-non-reasoning",
         url=cfg.get("grok_url") or "https://api.x.ai/v1/chat/completions",
-        image_model=cfg.get("grok_image_model") or "grok-imagine-image-2.0",
+        image_model=cfg.get("grok_image_model") or "grok-imagine-image",
         image_api_url=cfg.get("grok_image_api_url"),
     )
+    if grok.available:
+        await grok.refresh_chat_models()
     yookassa = cfg.get("yookassa_client")
     api, session = await _build_api(cfg["vk_token"])
     bg: list[asyncio.Task] = []

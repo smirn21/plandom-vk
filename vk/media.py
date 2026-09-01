@@ -10,11 +10,19 @@ from PIL import Image
 
 LOGGER = logging.getLogger(__name__)
 
+MAX_UPLOAD_SIDE = 2048
 
-def _jpeg_bytes(image_bytes: bytes, *, quality: int = 90) -> bytes:
+
+def _jpeg_bytes(image_bytes: bytes, *, quality: int = 85) -> bytes:
     """VK upload server часто не принимает PNG — конвертируем в JPEG."""
     img = Image.open(io.BytesIO(image_bytes))
     img.load()
+    if max(img.width, img.height) > MAX_UPLOAD_SIDE:
+        scale = MAX_UPLOAD_SIDE / max(img.width, img.height)
+        img = img.resize(
+            (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
     if img.width < 200 or img.height < 200:
         scale = max(200 / img.width, 200 / img.height)
         img = img.resize(
@@ -30,7 +38,7 @@ def _jpeg_bytes(image_bytes: bytes, *, quality: int = 90) -> bytes:
     elif img.mode != "RGB":
         img = img.convert("RGB")
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    img.save(buf, format="JPEG", quality=quality, optimize=False, progressive=False)
     jpeg = buf.getvalue()
     if len(jpeg) < 500:
         raise ValueError(f"JPEG too small ({len(jpeg)} bytes)")
@@ -44,6 +52,19 @@ def _photo_field_ok(value: Any) -> bool:
     return bool(text) and text not in ("[]", "{}", "null")
 
 
+async def _get_messages_upload_url(api: Any, peer_id: int, group_id: int | None) -> str | None:
+    params: dict[str, int] = {"peer_id": int(peer_id)}
+    if group_id:
+        params["group_id"] = int(group_id)
+    upload_server = await api.request("photos.getMessagesUploadServer", params)
+    server_data = upload_server
+    if isinstance(upload_server, dict) and "upload_url" not in upload_server:
+        server_data = upload_server.get("response") or upload_server
+    if isinstance(server_data, dict):
+        return server_data.get("upload_url")
+    return None
+
+
 async def upload_photo_to_messages(
     api: Any,
     peer_id: int,
@@ -52,71 +73,57 @@ async def upload_photo_to_messages(
     group_id: int | None = None,
 ) -> str | None:
     try:
-        params: dict[str, int] = {"peer_id": int(peer_id)}
-        if group_id:
-            params["group_id"] = int(group_id)
-        upload_server = await api.request("photos.getMessagesUploadServer", params)
-        server_data = upload_server
-        if isinstance(upload_server, dict) and "upload_url" not in upload_server:
-            server_data = upload_server.get("response") or upload_server
-        upload_url = server_data.get("upload_url") if isinstance(server_data, dict) else None
-        if not upload_url:
-            LOGGER.warning("No upload_url: %s", upload_server)
-            return None
-
-        jpeg = _jpeg_bytes(image_bytes)
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            files = {"photo": ("plan.jpg", jpeg, "image/jpeg")}
-            up_resp = await client.post(upload_url, files=files)
-            if up_resp.status_code != 200:
-                LOGGER.warning("Upload POST HTTP %s", up_resp.status_code)
+        for attempt, quality in enumerate((85, 75, 65), start=1):
+            upload_url = await _get_messages_upload_url(api, peer_id, group_id)
+            if not upload_url:
+                LOGGER.warning("No upload_url for peer=%s", peer_id)
                 return None
-            up_data = up_resp.json()
 
-        photo_raw = up_data.get("photo")
-        if not _photo_field_ok(photo_raw):
-            LOGGER.warning(
-                "Upload response without photo (len=%s): keys=%s preview=%r",
-                len(jpeg),
-                list(up_data.keys()),
-                str(photo_raw)[:80] if photo_raw is not None else None,
-            )
-            try:
-                jpeg = _jpeg_bytes(image_bytes, quality=75)
-                async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-                    files = {"photo": ("plan.jpg", jpeg, "image/jpeg")}
-                    up_resp = await client.post(upload_url, files=files)
-                    up_data = up_resp.json()
-                photo_raw = up_data.get("photo")
-            except Exception as retry_exc:
-                LOGGER.warning("Upload retry failed: %s", retry_exc)
+            jpeg = _jpeg_bytes(image_bytes, quality=quality)
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                files = {"photo": ("photo.jpg", jpeg, "image/jpeg")}
+                up_resp = await client.post(upload_url, files=files)
+                if up_resp.status_code != 200:
+                    LOGGER.warning("Upload POST HTTP %s (attempt %s)", up_resp.status_code, attempt)
+                    continue
+                up_data = up_resp.json()
+
+            photo_raw = up_data.get("photo")
             if not _photo_field_ok(photo_raw):
-                return None
+                LOGGER.warning(
+                    "Upload response without photo (attempt %s, len=%s): keys=%s preview=%r",
+                    attempt,
+                    len(jpeg),
+                    list(up_data.keys()),
+                    str(photo_raw)[:80] if photo_raw is not None else None,
+                )
+                continue
 
-        saved = await api.request(
-            "photos.saveMessagesPhoto",
-            {
+            save_params: dict[str, Any] = {
                 "photo": photo_raw,
                 "server": up_data.get("server"),
                 "hash": up_data.get("hash"),
-            },
-        )
-        photos = saved if isinstance(saved, list) else (
-            saved.get("response") if isinstance(saved, dict) else None
-        )
-        if not photos:
-            LOGGER.warning("photos.saveMessagesPhoto empty: %s", saved)
-            return None
-        photo = photos[0] if isinstance(photos, list) else photos
-        owner_id = photo.get("owner_id")
-        photo_id = photo.get("id")
-        access_key = photo.get("access_key")
-        if owner_id is None or photo_id is None:
-            return None
-        att = f"photo{owner_id}_{photo_id}"
-        if access_key:
-            att = f"{att}_{access_key}"
-        return att
+            }
+            if group_id:
+                save_params["group_id"] = int(group_id)
+            saved = await api.request("photos.saveMessagesPhoto", save_params)
+            photos = saved if isinstance(saved, list) else (
+                saved.get("response") if isinstance(saved, dict) else None
+            )
+            if not photos:
+                LOGGER.warning("photos.saveMessagesPhoto empty: %s", saved)
+                continue
+            photo = photos[0] if isinstance(photos, list) else photos
+            owner_id = photo.get("owner_id")
+            photo_id = photo.get("id")
+            access_key = photo.get("access_key")
+            if owner_id is None or photo_id is None:
+                continue
+            att = f"photo{owner_id}_{photo_id}"
+            if access_key:
+                att = f"{att}_{access_key}"
+            return att
+        return None
     except Exception as exc:
         LOGGER.warning("upload_photo failed: %s", exc)
         return None
