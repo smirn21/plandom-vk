@@ -13,13 +13,14 @@ LOGGER = logging.getLogger(__name__)
 
 IMAGE_API_BASE = "https://api.x.ai/v1"
 DEFAULT_IMAGE_MODEL = "grok-imagine-image"
-DEFAULT_CHAT_MODEL = "grok-4-1-fast-non-reasoning"
+DEFAULT_CHAT_MODEL = "grok-build-0.1"
 IMAGE_MODEL_FALLBACKS = (
     "grok-imagine-image",
     "grok-imagine-image-quality",
     "grok-imagine-image-2.0",
 )
 CHAT_MODEL_FALLBACKS = (
+    "grok-build-0.1",
     "grok-4-1-fast-non-reasoning",
     "grok-4-fast-non-reasoning",
     "grok-2-1212",
@@ -29,6 +30,17 @@ CHAT_MODEL_FALLBACKS = (
     "grok-3-mini",
 )
 MODELS_LIST_URL = "https://api.x.ai/v1/models"
+
+ROOM_TYPE_IMAGE_HINTS: dict[str, str] = {
+    "bedroom": "master bedroom: double bed, nightstands, wardrobe, soft bedding, curtains",
+    "bath": "bathroom: toilet, sink, vanity, shower or bathtub, wall and floor tiles",
+    "living": "living room: sofa, coffee table, TV wall, rug, ambient lighting",
+    "kitchen": "kitchen: cabinets, countertop, sink, stove, dining zone if space allows",
+    "hall": "entry hallway: console, mirror, shoe storage, coat hooks, good lighting",
+    "office": "home office: desk, ergonomic chair, shelves, task lighting",
+    "kids": "children room: bed, desk, toy storage, playful but tidy decor",
+    "other": "functional interior appropriate to the room purpose",
+}
 
 
 def is_grok_image_model(name: str) -> bool:
@@ -76,6 +88,7 @@ class GrokClient:
         self._blocked_image_models: set[str] = set()
         self._blocked_chat_models: set[str] = set()
         self._available_chat_models: list[str] | None = None
+        self._available_image_models: list[str] | None = None
 
     @property
     def available(self) -> bool:
@@ -105,7 +118,8 @@ class GrokClient:
 
     def _chat_model_candidates(self) -> list[str]:
         models: list[str] = []
-        for name in (self.model, *CHAT_MODEL_FALLBACKS):
+
+        def add(name: str) -> None:
             if (
                 name
                 and name not in models
@@ -113,12 +127,15 @@ class GrokClient:
                 and name not in self._blocked_chat_models
             ):
                 models.append(name)
+
         if self._available_chat_models:
-            known = set(models)
             for name in self._available_chat_models:
-                if name not in known and name not in self._blocked_chat_models:
-                    models.append(name)
-                    known.add(name)
+                add(name)
+            return models
+
+        add(self.model)
+        for name in CHAT_MODEL_FALLBACKS:
+            add(name)
         return models
 
     async def refresh_chat_models(self) -> None:
@@ -134,17 +151,22 @@ class GrokClient:
             items = body.get("data") if isinstance(body, dict) else None
             if not isinstance(items, list):
                 return
-            chat_models = [
-                str(item.get("id"))
-                for item in items
-                if isinstance(item, dict)
-                and item.get("id")
-                and not is_grok_image_model(str(item["id"]))
-                and "voice" not in str(item["id"]).lower()
-            ]
+            chat_models: list[str] = []
+            image_models: list[str] = []
+            for item in items:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                model_id = str(item["id"])
+                if is_grok_image_model(model_id):
+                    image_models.append(model_id)
+                elif "voice" not in model_id.lower():
+                    chat_models.append(model_id)
             if chat_models:
                 self._available_chat_models = chat_models
                 LOGGER.info("Grok chat models available: %s", ", ".join(chat_models[:8]))
+            if image_models:
+                self._available_image_models = image_models
+                LOGGER.info("Grok image models available: %s", ", ".join(image_models[:8]))
         except Exception as exc:
             LOGGER.debug("Grok models list failed: %s", exc)
 
@@ -271,20 +293,24 @@ class GrokClient:
         room_names = "; ".join(room_lines) or "одна комната"
         area = brief.get("total_area_m2") or "не указана"
         ptype = brief.get("project_type", "apartment")
+        room_count = len(rooms)
         system = (
-            "Ты архитектор-планировщик. Отвечай ТОЛЬКО валидным JSON без markdown. "
+            "Ты профессиональный архитектор-планировщик с 15-летним опытом жилых интерьеров. "
+            "Отвечай ТОЛЬКО валидным JSON без markdown. "
             'Формат: {"rooms":[{"name":"...","x":0,"y":0,"w":40,"h":30,'
             '"width_m":3.2,"length_m":4.5,"doors":[],"windows":[]}]} '
             "Координаты x,y,w,h — 0..100, комнаты не пересекаются. "
+            f"ОБЯЗАТЕЛЬНО верни ровно {room_count} комнат — ни одной больше, ни одной меньше. "
             "Сохраняй реальные размеры комнат если указаны."
         )
         prompt = (
-            f"Тип: {ptype}. Площадь: {area} м². Комнаты: {room_names}. "
+            f"Тип: {ptype}. Площадь: {area} м². "
+            f"Список комнат ({room_count} шт., каждая обязательна): {room_names}. "
             f"Потолок: {brief.get('ceiling_height_m', 'стандарт')} м. "
             f"Окна/двери: {brief.get('openings_notes', '')}. "
             f"Мокрые зоны: {brief.get('wet_zones', '')}. "
             f"Заметки: {brief.get('notes', '')}. "
-            "Расположи комнаты логично."
+            "Расположи комнаты логично: санузел у мокрой зоны, спальня приватно, гостиная центрально."
         )
         try:
             raw = await self.answer_text(prompt, system, max_tokens=900)
@@ -325,12 +351,15 @@ class GrokClient:
                 "Диван, стол, освещение, растения — уютная обстановка."
             )
         system = (
-            "Ты дизайнер интерьеров. Кратко опиши обстановку комнаты на русском: "
-            "мебель, цвета, материалы, 4–6 предложений, без markdown."
+            "Ты профессиональный дизайнер интерьеров премиум-класса. "
+            "Пиши как для презентации клиенту: конкретная мебель, материалы, палитра, "
+            "освещение, текстуры. 4–6 предложений на русском, без markdown."
         )
+        room_type = room.get("room_type") or "other"
         prompt = (
-            f"Комната: {name}.{size} Стиль: {style}. Бюджет: {budget}. "
-            f"Пожелания: {wishes}. Заметки: {brief.get('notes', '')}"
+            f"Комната: {name} (тип: {room_type}).{size} Стиль: {style}. Бюджет: {budget}. "
+            f"Пожелания клиента: {wishes}. Заметки: {brief.get('notes', '')}. "
+            f"Опиши именно {name}, не путай с другими помещениями."
         )
         try:
             return await self.answer_text(prompt, system, max_tokens=400)
@@ -350,6 +379,8 @@ class GrokClient:
         style_notes = brief.get("style_notes") or ""
         budget = brief.get("budget_tier", "medium")
         name = room.get("name") or "room"
+        room_type = str(room.get("room_type") or "other")
+        type_hint = ROOM_TYPE_IMAGE_HINTS.get(room_type, ROOM_TYPE_IMAGE_HINTS["other"])
         ceiling = brief.get("ceiling_height_m") or 2.7
         size = ""
         if room.get("width_m") and room.get("length_m"):
@@ -359,15 +390,18 @@ class GrokClient:
         view_map = {
             "entrance": "camera at entrance doorway looking into the room",
             "window": "camera facing the window wall, natural daylight",
+            "corner": "wide corner angle showing two walls and depth of the room",
         }
         view_line = view_map.get(view, view_map["entrance"])
         wishes = brief.get("furniture_wishes") or ""
         return (
-            f"Professional photorealistic interior design photograph of {name}, "
-            f"{style} style {style_notes}, {budget} budget furniture, room size {size}, "
-            f"ceiling height {ceiling}m. {view_line}. "
-            f"Design brief: {description}. User wishes: {wishes}. "
-            "High-end architectural photography, realistic materials, soft natural lighting, "
+            f"Professional interior design photography by an award-winning designer. "
+            f"Room: {name}. Room type: {room_type}. Required elements: {type_hint}. "
+            f"Style: {style} {style_notes}. Budget tier: {budget}. Size: {size}. "
+            f"Ceiling height {ceiling}m. {view_line}. "
+            f"Designer brief: {description}. Client wishes: {wishes}. "
+            f"CRITICAL: image must clearly be a {name} ({room_type}), not another room type. "
+            "Photorealistic, magazine-quality, natural materials, soft daylight, "
             "no people, no logos, no text, no watermarks, 8k detail."
         )
 
@@ -375,9 +409,18 @@ class GrokClient:
         if self._working_image_model:
             return [self._working_image_model]
         models: list[str] = []
-        for name in (self.image_model, *IMAGE_MODEL_FALLBACKS):
+
+        def add(name: str) -> None:
             if name and name not in models and name not in self._blocked_image_models:
                 models.append(name)
+
+        if self._available_image_models:
+            for name in self._available_image_models:
+                add(name)
+            return models
+
+        for name in (self.image_model, *IMAGE_MODEL_FALLBACKS):
+            add(name)
         return models
 
     @staticmethod

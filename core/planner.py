@@ -22,25 +22,59 @@ def grid_layout(brief: ProjectBrief) -> dict[str, Any]:
         layout_rooms.append(
             {
                 "name": room.name,
+                "room_type": room.room_type.value,
                 "x": round(2 + col * cell_w, 1),
                 "y": round(2 + row * cell_h, 1),
                 "w": round(cell_w - 2, 1),
                 "h": round(cell_h - 2, 1),
+                "width_m": room.width_m,
+                "length_m": room.length_m,
+                "area_m2": room.area_m2,
+                "doors": list(room.doors),
+                "windows": list(room.windows),
             }
         )
     return {"rooms": layout_rooms}
+
+
+def _merge_layout(brief: ProjectBrief, grok_rooms: list[dict[str, Any]]) -> dict[str, Any]:
+    """Grok может вернуть меньше комнат — дополняем из brief и grid."""
+    fallback = grid_layout(brief)
+    fb_rooms = fallback["rooms"]
+    merged: list[dict[str, Any]] = []
+    for i, spec in enumerate(brief.rooms or []):
+        base = dict(fb_rooms[i]) if i < len(fb_rooms) else {
+            "name": spec.name,
+            "room_type": spec.room_type.value,
+            "x": 2,
+            "y": 2,
+            "w": 30,
+            "h": 30,
+        }
+        if i < len(grok_rooms):
+            gr = grok_rooms[i]
+            for key in ("x", "y", "w", "h", "doors", "windows"):
+                if key in gr:
+                    base[key] = gr[key]
+        base["name"] = spec.name
+        base["room_type"] = spec.room_type.value
+        if spec.width_m is not None:
+            base["width_m"] = spec.width_m
+        if spec.length_m is not None:
+            base["length_m"] = spec.length_m
+        if spec.area_m2 is not None:
+            base["area_m2"] = spec.area_m2
+        merged.append(base)
+    return {"rooms": merged}
 
 
 async def build_layout(brief: ProjectBrief, grok: GrokClient | None) -> dict[str, Any]:
     data = brief.to_dict()
     if grok and grok.available:
         layout = await grok.generate_layout(data)
-        if layout.get("rooms"):
-            names = [r.name for r in brief.rooms]
-            for i, room in enumerate(layout["rooms"]):
-                if i < len(names):
-                    room["name"] = names[i]
-            return layout
+        grok_rooms = layout.get("rooms") or []
+        if grok_rooms and brief.rooms:
+            return _merge_layout(brief, grok_rooms)
     return grid_layout(brief)
 
 

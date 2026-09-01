@@ -158,6 +158,7 @@ async def _run_generation(
     is_full = tier in ("pro", "full")
     is_pro = tier == "pro"
     room_items_pdf: list[tuple[str, Path, str]] = []
+    upload_warnings: list[str] = []
 
     for i, room in enumerate(layout.get("rooms") or []):
         name = room.get("name") or f"Комната {i + 1}"
@@ -172,19 +173,32 @@ async def _run_generation(
             i + 1,
             pro_variants=is_pro,
         )
+        room_uploaded = 0
         for card_path in image_paths:
             if not hd_room:
                 add_watermark(card_path)
             att = await upload_photo_to_messages(api, peer_id, png_bytes(card_path), group_id=group_id)
             if att:
                 attachments.append(att)
-            await asyncio.sleep(0.5)
+                room_uploaded += 1
+            else:
+                LOGGER.warning("VK upload failed: room=%s file=%s", name, card_path.name)
+            await asyncio.sleep(1.2)
         if image_paths:
             room_items_pdf.append((name, image_paths[0], desc))
+        if image_paths and room_uploaded == 0:
+            upload_warnings.append(f"⚠️ Не удалось загрузить фото: {name}")
 
     pdf_path = out_dir / "project.pdf"
     include_pdf = tier in ("pro", "full") or is_full
     msg_lines = ["✅ Проект готов!\n"]
+    room_names = [
+        r.get("name") or f"Комната {i + 1}"
+        for i, r in enumerate(layout.get("rooms") or [])
+    ]
+    if room_names:
+        msg_lines.append("Комнаты: " + ", ".join(room_names))
+    msg_lines.extend(upload_warnings)
 
     if tier == "full":
         storage.consume_project_payment(user_id, project_id)

@@ -1,0 +1,15 @@
+---
+description: ПланДом VK — читать AGENTS.md перед любой работой над проектом
+alwaysApply: true
+---
+
+# ПланДом VK
+
+Перед редактированием кода **прочитай [AGENTS.md](../../AGENTS.md)** в корне репозитория.
+
+Кратко:
+- `GROK_MODEL` = chat (`grok-build-0.1`), `GROK_IMAGE_MODEL` = image (`grok-imagine-image`)
+- Все комнаты из wizard должны попасть в layout и получить рендер
+- Промпты Grok — от профессионального дизайнера интерьеров
+- VK upload: JPEG через `core/image_normalize.py`, новый upload URL на попытку
+- Коммиты на русском, только по запросу пользователя

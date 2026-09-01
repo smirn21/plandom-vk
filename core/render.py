@@ -90,7 +90,10 @@ def add_watermark(image_path: Path, label: str = "ПланДом — превь�
     draw.text((x, y), text, fill=(255, 255, 255, 170), font=font)
     draw.line([(0, img.height), (img.width, 0)], fill=(255, 255, 255, 80), width=3)
     out = Image.alpha_composite(img, overlay).convert("RGB")
-    out.save(image_path, format="PNG", optimize=True)
+    if image_path.suffix.lower() in (".jpg", ".jpeg"):
+        out.save(image_path, format="JPEG", quality=85, optimize=False)
+    else:
+        out.save(image_path, format="PNG", optimize=True)
     return image_path
 
 

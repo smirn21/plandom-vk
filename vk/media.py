@@ -8,17 +8,23 @@ from typing import Any
 import httpx
 from PIL import Image
 
-LOGGER = logging.getLogger(__name__)
+from core.image_normalize import normalize_image_bytes, MAX_VK_SIDE
 
-MAX_UPLOAD_SIDE = 2048
+LOGGER = logging.getLogger(__name__)
 
 
 def _jpeg_bytes(image_bytes: bytes, *, quality: int = 85) -> bytes:
     """VK upload server часто не принимает PNG — конвертируем в JPEG."""
+    try:
+        normalized = normalize_image_bytes(image_bytes, quality=quality)
+        if len(normalized) >= 500:
+            return normalized
+    except Exception:
+        pass
     img = Image.open(io.BytesIO(image_bytes))
     img.load()
-    if max(img.width, img.height) > MAX_UPLOAD_SIDE:
-        scale = MAX_UPLOAD_SIDE / max(img.width, img.height)
+    if max(img.width, img.height) > MAX_VK_SIDE:
+        scale = MAX_VK_SIDE / max(img.width, img.height)
         img = img.resize(
             (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
             Image.Resampling.LANCZOS,
@@ -80,7 +86,7 @@ async def upload_photo_to_messages(
                 return None
 
             jpeg = _jpeg_bytes(image_bytes, quality=quality)
-            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:
                 files = {"photo": ("photo.jpg", jpeg, "image/jpeg")}
                 up_resp = await client.post(upload_url, files=files)
                 if up_resp.status_code != 200:

@@ -154,7 +154,7 @@ async def _run_bot(cfg: dict) -> None:
     storage = create_storage(cfg["db_path"])
     grok = GrokClient(
         api_key=cfg.get("grok_api_key") or "",
-        model=cfg.get("grok_model") or "grok-4-1-fast-non-reasoning",
+        model=cfg.get("grok_model") or "grok-build-0.1",
         url=cfg.get("grok_url") or "https://api.x.ai/v1/chat/completions",
         image_model=cfg.get("grok_image_model") or "grok-imagine-image",
         image_api_url=cfg.get("grok_image_api_url"),
