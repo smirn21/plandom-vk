@@ -11,9 +11,16 @@ from PIL import Image
 LOGGER = logging.getLogger(__name__)
 
 
-def _jpeg_bytes(image_bytes: bytes) -> bytes:
+def _jpeg_bytes(image_bytes: bytes, *, quality: int = 90) -> bytes:
     """VK upload server часто не принимает PNG — конвертируем в JPEG."""
     img = Image.open(io.BytesIO(image_bytes))
+    img.load()
+    if img.width < 200 or img.height < 200:
+        scale = max(200 / img.width, 200 / img.height)
+        img = img.resize(
+            (max(200, int(img.width * scale)), max(200, int(img.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
     if img.mode in ("RGBA", "P", "LA"):
         bg = Image.new("RGB", img.size, (255, 255, 255))
         if img.mode == "P":
@@ -23,8 +30,18 @@ def _jpeg_bytes(image_bytes: bytes) -> bytes:
     elif img.mode != "RGB":
         img = img.convert("RGB")
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=90, optimize=True)
-    return buf.getvalue()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    jpeg = buf.getvalue()
+    if len(jpeg) < 500:
+        raise ValueError(f"JPEG too small ({len(jpeg)} bytes)")
+    return jpeg
+
+
+def _photo_field_ok(value: Any) -> bool:
+    if value is None:
+        return False
+    text = str(value).strip()
+    return bool(text) and text not in ("[]", "{}", "null")
 
 
 async def upload_photo_to_messages(
@@ -57,9 +74,24 @@ async def upload_photo_to_messages(
             up_data = up_resp.json()
 
         photo_raw = up_data.get("photo")
-        if not photo_raw:
-            LOGGER.warning("Upload response without photo: %s", list(up_data.keys()))
-            return None
+        if not _photo_field_ok(photo_raw):
+            LOGGER.warning(
+                "Upload response without photo (len=%s): keys=%s preview=%r",
+                len(jpeg),
+                list(up_data.keys()),
+                str(photo_raw)[:80] if photo_raw is not None else None,
+            )
+            try:
+                jpeg = _jpeg_bytes(image_bytes, quality=75)
+                async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                    files = {"photo": ("plan.jpg", jpeg, "image/jpeg")}
+                    up_resp = await client.post(upload_url, files=files)
+                    up_data = up_resp.json()
+                photo_raw = up_data.get("photo")
+            except Exception as retry_exc:
+                LOGGER.warning("Upload retry failed: %s", retry_exc)
+            if not _photo_field_ok(photo_raw):
+                return None
 
         saved = await api.request(
             "photos.saveMessagesPhoto",

@@ -12,11 +12,17 @@ import httpx
 LOGGER = logging.getLogger(__name__)
 
 IMAGE_API_BASE = "https://api.x.ai/v1"
-DEFAULT_IMAGE_MODEL = "grok-imagine-image-2.0"
+DEFAULT_IMAGE_MODEL = "grok-imagine-image"
+DEFAULT_CHAT_MODEL = "grok-3"
 IMAGE_MODEL_FALLBACKS = (
-    "grok-imagine-image-2.0",
-    "grok-imagine-image-quality",
     "grok-imagine-image",
+    "grok-imagine-image-quality",
+    "grok-imagine-image-2.0",
+)
+CHAT_MODEL_FALLBACKS = (
+    "grok-3",
+    "grok-3-mini",
+    "grok-2-latest",
 )
 
 
@@ -24,7 +30,7 @@ class GrokClient:
     def __init__(
         self,
         api_key: str,
-        model: str = "grok-2-latest",
+        model: str = DEFAULT_CHAT_MODEL,
         url: str = "https://api.x.ai/v1/chat/completions",
         *,
         image_model: str = DEFAULT_IMAGE_MODEL,
@@ -35,6 +41,8 @@ class GrokClient:
         self.url = url
         self.image_model = image_model
         self.image_api_url = image_api_url or f"{IMAGE_API_BASE}/images/generations"
+        self._working_image_model: str | None = None
+        self._blocked_image_models: set[str] = set()
 
     @property
     def available(self) -> bool:
@@ -62,28 +70,52 @@ class GrokClient:
                 response.raise_for_status()
             return response.status_code, body
 
+    def _chat_model_candidates(self) -> list[str]:
+        models: list[str] = []
+        for name in (self.model, *CHAT_MODEL_FALLBACKS):
+            if name and name not in models:
+                models.append(name)
+        return models
+
+    async def _chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int,
+        temperature: float,
+        timeout: float = 120,
+    ) -> str:
+        last_error = ""
+        for model in self._chat_model_candidates():
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_completion_tokens": max_tokens,
+            }
+            status, body = await self._post_json(
+                self.url, payload, timeout=timeout, raise_for_status=False
+            )
+            if status == 200 and isinstance(body, dict):
+                try:
+                    return body["choices"][0]["message"]["content"].strip()
+                except (KeyError, IndexError, TypeError) as exc:
+                    raise RuntimeError(f"Unexpected Grok response: {body}") from exc
+            err = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)[:400]
+            last_error = f"HTTP {status} model={model}: {err}"
+            LOGGER.warning("Grok chat attempt failed: %s", last_error)
+        raise RuntimeError(last_error or "Grok chat failed")
+
     async def answer_text(
         self, user_text: str, system: str, *, max_tokens: int = 800
     ) -> str:
         if not self.api_key:
             raise RuntimeError("GROK_API_KEY не задан")
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_text},
-            ],
-            "temperature": 0.2,
-            "max_output_tokens": max_tokens,
-        }
-        data = await self._post_json(self.url, payload)
-        _, body = data
-        if not isinstance(body, dict):
-            raise RuntimeError(f"Unexpected Grok response: {body}")
-        try:
-            return body["choices"][0]["message"]["content"].strip()
-        except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError(f"Unexpected Grok response: {body}") from exc
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_text},
+        ]
+        return await self._chat_completion(messages, max_tokens=max_tokens, temperature=0.2)
 
     async def answer_vision(
         self,
@@ -95,28 +127,19 @@ class GrokClient:
     ) -> str:
         if not self.api_key:
             raise RuntimeError("GROK_API_KEY не задан")
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": image_data_uri, "detail": "high"}},
-                        {"type": "text", "text": prompt},
-                    ],
-                },
-            ],
-            "temperature": 0.1,
-            "max_output_tokens": max_tokens,
-        }
-        _, body = await self._post_json(self.url, payload, timeout=150)
-        if not isinstance(body, dict):
-            raise RuntimeError(f"Unexpected Grok vision response: {body}")
-        try:
-            return body["choices"][0]["message"]["content"].strip()
-        except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError(f"Unexpected Grok vision response: {body}") from exc
+        messages = [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_data_uri, "detail": "high"}},
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ]
+        return await self._chat_completion(
+            messages, max_tokens=max_tokens, temperature=0.1, timeout=150
+        )
 
     @staticmethod
     def _extract_json(text: str) -> dict[str, Any]:
@@ -270,39 +293,33 @@ class GrokClient:
         )
 
     def _image_model_candidates(self) -> list[str]:
+        if self._working_image_model:
+            return [self._working_image_model]
         models: list[str] = []
         for name in (self.image_model, *IMAGE_MODEL_FALLBACKS):
-            if name and name not in models:
+            if name and name not in models and name not in self._blocked_image_models:
                 models.append(name)
         return models
 
     @staticmethod
     def _image_payload_variants(model: str, prompt: str, *, quality: str) -> list[dict[str, Any]]:
-        variants = [
-            {
-                "model": model,
-                "prompt": prompt,
-                "n": 1,
-                "aspect_ratio": "4:3",
-                "resolution": "2k",
-                "response_format": "b64_json",
-            },
-            {
-                "model": model,
-                "prompt": prompt,
-                "n": 1,
-                "aspect_ratio": "4:3",
-                "response_format": "b64_json",
-            },
-            {
-                "model": model,
-                "prompt": prompt,
-                "n": 1,
-            },
-        ]
         if model == "grok-imagine-image-2.0":
-            variants[0]["quality"] = quality
-        return variants
+            return [
+                {
+                    "model": model,
+                    "prompt": prompt,
+                    "n": 1,
+                    "aspect_ratio": "4:3",
+                    "quality": quality,
+                    "response_format": "b64_json",
+                },
+                {"model": model, "prompt": prompt, "n": 1, "aspect_ratio": "4:3"},
+                {"model": model, "prompt": prompt, "n": 1},
+            ]
+        return [
+            {"model": model, "prompt": prompt, "n": 1, "response_format": "b64_json"},
+            {"model": model, "prompt": prompt, "n": 1},
+        ]
 
     async def _decode_image_response(self, data: dict[str, Any]) -> bytes | None:
         items = data.get("data") or []
@@ -344,9 +361,13 @@ class GrokClient:
                     if status == 200 and isinstance(body, dict):
                         image = await self._decode_image_response(body)
                         if image:
+                            self._working_image_model = model
                             if model != self.image_model:
                                 LOGGER.info("Grok image ok with model %s", model)
                             return image
+                    if status == 404:
+                        self._blocked_image_models.add(model)
+                        break
                     err = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)[:300]
                     last_error = f"HTTP {status} model={model}: {err}"
                     LOGGER.debug("Grok image attempt failed: %s", last_error)

@@ -39,6 +39,8 @@ def layout_to_png(
         import cairosvg
 
         cairosvg.svg2png(bytestring=svg_text.encode("utf-8"), write_to=str(out_path))
+        img = Image.open(out_path).convert("RGB")
+        img.save(out_path, format="PNG", optimize=True)
         return out_path
     except Exception:
         pass

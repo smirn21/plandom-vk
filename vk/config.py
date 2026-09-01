@@ -40,8 +40,8 @@ def get_config() -> dict:
         "database_url": (os.getenv("DATABASE_URL") or "").strip() or None,
         "yookassa_client": build_yookassa_client(),
         "grok_api_key": (os.getenv("GROK_API_KEY") or "").strip(),
-        "grok_model": (os.getenv("GROK_MODEL") or "grok-2-latest").strip(),
-        "grok_image_model": (os.getenv("GROK_IMAGE_MODEL") or "grok-imagine-image-2.0").strip(),
+        "grok_model": (os.getenv("GROK_MODEL") or "grok-3").strip(),
+        "grok_image_model": (os.getenv("GROK_IMAGE_MODEL") or "grok-imagine-image").strip(),
         "grok_image_api_url": (os.getenv("GROK_IMAGE_API_URL") or "").strip() or None,
         "grok_url": (
             os.getenv("GROK_API_URL") or "https://api.x.ai/v1/chat/completions"
