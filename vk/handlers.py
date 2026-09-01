@@ -9,6 +9,10 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from vk.http_fix import patch_vkbottle_pydantic
+
+patch_vkbottle_pydantic()
+
 from vkbottle import GroupEventType
 from vkbottle.bot import Message, MessageEvent
 

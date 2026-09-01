@@ -6,6 +6,6 @@ VENV="${ROOT}/vk/.venv"
 if [[ ! -d "$VENV" ]]; then
   python3 -m venv "$VENV"
   "$VENV/bin/pip" install -U pip
-  "$VENV/bin/pip" install -r requirements.txt
 fi
+"$VENV/bin/pip" install -q -r requirements.txt
 exec "$VENV/bin/python" -m vk.main

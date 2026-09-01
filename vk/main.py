@@ -23,6 +23,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+from vk.http_fix import patch_vkbottle_pydantic  # noqa: E402
+
+patch_vkbottle_pydantic()
+
 
 async def _build_api(token: str):
     import aiohttp
