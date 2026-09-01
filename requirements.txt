@@ -1,0 +1,5 @@
+vkbottle>=4.10
+httpx>=0.27
+python-dotenv>=1.0
+aiohttp>=3.9
+certifi
