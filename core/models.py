@@ -29,6 +29,9 @@ class RoomSpec:
     room_type: RoomType
     width_m: float | None = None
     length_m: float | None = None
+    area_m2: float | None = None
+    doors: list[dict[str, Any]] = field(default_factory=list)
+    windows: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -38,9 +41,16 @@ class ProjectBrief:
     total_area_m2: float | None
     rooms: list[RoomSpec] = field(default_factory=list)
     style: str = "scandinavian"
+    style_notes: str = ""
     budget_tier: str = "medium"  # economy | medium | premium
     floors: int = 1
     notes: str = ""
+    ceiling_height_m: float | None = None
+    openings_notes: str = ""
+    wet_zones: str = ""
+    furniture_wishes: str = ""
+    blueprint_estimated: bool = False
+    input_mode: str = "manual"  # manual | blueprint
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -52,11 +62,21 @@ class ProjectBrief:
                     "room_type": r.room_type.value,
                     "width_m": r.width_m,
                     "length_m": r.length_m,
+                    "area_m2": r.area_m2,
+                    "doors": r.doors,
+                    "windows": r.windows,
                 }
                 for r in self.rooms
             ],
             "style": self.style,
+            "style_notes": self.style_notes,
             "budget_tier": self.budget_tier,
             "floors": self.floors,
             "notes": self.notes,
+            "ceiling_height_m": self.ceiling_height_m,
+            "openings_notes": self.openings_notes,
+            "wet_zones": self.wet_zones,
+            "furniture_wishes": self.furniture_wishes,
+            "blueprint_estimated": self.blueprint_estimated,
+            "input_mode": self.input_mode,
         }

@@ -19,11 +19,22 @@ from vkbottle.bot import Message, MessageEvent
 from core.image_gen import render_room_card
 from core.models import ProjectType, RoomSpec, RoomType
 from core.planner import brief_from_wizard, build_layout
+from core.room_render import render_room_images
 from core.render import add_watermark, build_pdf, layout_to_png, png_bytes
+from core.dimensions import parse_area_value
+from core.blueprint_service import recognize_blueprint_files
 from grok_client import GrokClient
 from storage import Storage
 from vk import keyboards
+from vk.attachments import save_message_attachments
 from vk.media import upload_doc_to_messages, upload_photo_to_messages
+from vk.wizard_flow import (
+    apply_blueprint_to_wizard,
+    blueprint_review_summary,
+    check_area_mismatch,
+    parse_room_sizes_step,
+    wizard_summary,
+)
 from vk.admin import (
     handle_admin_callback,
     handle_admin_text_command,
@@ -36,11 +47,12 @@ LOGGER = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_ROOT = REPO_ROOT / "output"
+WIZARD_UPLOAD_ROOT = OUTPUT_ROOT / "wizard"
 
 WELCOME = (
-    "🏠 **ПланДом** — AI-планировка и обстановка квартир и домов.\n\n"
-    "Бесплатно: схема + 1 комната в HD.\n"
-    "Полный проект: все комнаты + PDF.\n\n"
+    "🏠 **ПланДом** — AI-планировка и фотореалистичный дизайн комнат.\n\n"
+    "Бесплатно: план + 1 комната в HD (2 ракурса).\n"
+    "Можно загрузить чертёж или ввести размеры вручную.\n\n"
     "Нажмите «🏠 Новый проект» или выберите тип ниже."
 )
 
@@ -84,20 +96,22 @@ def _resolve_tier(storage: Storage, user_id: str, project_type: str) -> str:
 
 
 def _summary(data: dict) -> str:
-    ptype = data.get("project_type", "apartment")
-    labels = {"apartment": "Квартира", "house": "Дом", "single_room": "Одна комната"}
-    rooms = data.get("rooms") or []
-    room_list = ", ".join(r.get("name", "?") for r in rooms) or "—"
-    area = data.get("total_area_m2")
-    area_s = f"{area} м²" if area else "не указана"
-    return (
-        f"📋 Проверьте данные:\n\n"
-        f"Тип: {labels.get(ptype, ptype)}\n"
-        f"Площадь: {area_s}\n"
-        f"Комнаты: {room_list}\n"
-        f"Стиль: {data.get('style', 'scandinavian')}\n"
-        f"Бюджет: {data.get('budget_tier', 'medium')}"
-    )
+    return wizard_summary(data)
+
+
+async def _parse_blueprints(
+    grok: GrokClient,
+    user_id: str,
+    data: dict,
+) -> dict:
+    pending = data.get("blueprint_pending_files") or []
+    paths = [Path(p) for p in pending if Path(p).is_file()]
+    if not paths:
+        upload_dir = WIZARD_UPLOAD_ROOT / user_id
+        paths = sorted(upload_dir.glob("*")) if upload_dir.is_dir() else []
+    parsed = await recognize_blueprint_files(grok, paths)
+    parsed["blueprint_files"] = [str(p) for p in paths]
+    return apply_blueprint_to_wizard(data, parsed)
 
 
 async def _run_generation(
@@ -127,33 +141,46 @@ async def _run_generation(
     await _send(api, peer_id, "⏳ Строю планировку и обставляю комнаты…")
 
     layout = await build_layout(brief, grok)
+    if brief.total_area_m2:
+        layout["total_area_m2"] = brief.total_area_m2
     storage.update_project(project_id, layout=layout)
 
-    plan_path = layout_to_png(layout, out_dir / "plan.png")
+    plan_path = layout_to_png(
+        layout,
+        out_dir / "plan.png",
+        estimated=bool(data.get("blueprint_estimated")),
+    )
     attachments: list[str] = []
     plan_att = await upload_photo_to_messages(api, peer_id, png_bytes(plan_path), group_id=group_id)
     if plan_att:
         attachments.append(plan_att)
 
     is_full = tier in ("pro", "full")
+    is_pro = tier == "pro"
     room_items_pdf: list[tuple[str, Path, str]] = []
-    free_hd_left = 1 if tier == "free" else 999
 
     for i, room in enumerate(layout.get("rooms") or []):
         name = room.get("name") or f"Комната {i + 1}"
         desc = await grok.describe_room(room, brief.to_dict())
-        card_path = out_dir / f"room_{i + 1}.png"
-        render_room_card(name, desc, brief.style, card_path)
-        hd = is_full or free_hd_left > 0
-        if not hd:
-            add_watermark(card_path)
-        else:
-            free_hd_left -= 1
-        room_items_pdf.append((name, card_path, desc))
-        att = await upload_photo_to_messages(api, peer_id, png_bytes(card_path), group_id=group_id)
-        if att:
-            attachments.append(att)
-        await asyncio.sleep(0.4)
+        hd_room = tier in ("pro", "full") or (tier == "free" and i == 0)
+        image_paths = await render_room_images(
+            grok,
+            room,
+            brief.to_dict(),
+            desc,
+            out_dir,
+            i + 1,
+            pro_variants=is_pro,
+        )
+        for card_path in image_paths:
+            if not hd_room:
+                add_watermark(card_path)
+            att = await upload_photo_to_messages(api, peer_id, png_bytes(card_path), group_id=group_id)
+            if att:
+                attachments.append(att)
+            await asyncio.sleep(0.5)
+        if image_paths:
+            room_items_pdf.append((name, image_paths[0], desc))
 
     pdf_path = out_dir / "project.pdf"
     include_pdf = tier in ("pro", "full") or is_full
@@ -298,17 +325,144 @@ def setup_handlers(bot, storage: Storage, grok: GrokClient, cfg: dict) -> None:
             return
 
         step, data = storage.get_wizard(user_id)
-        if step == "area_input":
-            try:
-                data["total_area_m2"] = float(text.replace(",", "."))
-            except ValueError:
-                await send("Введите число, например 65")
+
+        if step == "blueprint_upload":
+            upload_dir = WIZARD_UPLOAD_ROOT / user_id
+            saved = await save_message_attachments(message, upload_dir)
+            if saved:
+                pending = list(data.get("blueprint_pending_files") or [])
+                pending.extend(str(p) for p in saved)
+                data["blueprint_pending_files"] = pending
+                storage.set_wizard(user_id, "blueprint_upload", data)
+                await send(
+                    f"📎 Файлов: {len(pending)}. Можно прислать ещё (другой этаж) "
+                    "или нажмите «Готово, распознать».",
+                    keyboard=keyboards.blueprint_upload_keyboard(),
+                )
                 return
+            if text:
+                await send(
+                    "Пришлите фото/PDF/SVG/DXF чертежа или нажмите «Готово».",
+                    keyboard=keyboards.blueprint_upload_keyboard(),
+                )
+                return
+
+        if step == "area_input":
+            val = parse_area_value(text)
+            if val is None:
+                await send("Введите площадь, например 65 или 8.5×12")
+                return
+            data["total_area_m2"] = val
             storage.set_wizard(user_id, "rooms", data)
+            await send("Отметьте комнаты:", keyboard=keyboards.rooms_keyboard(set()))
+            return
+
+        if step == "area_dims_input":
+            val = parse_area_value(text)
+            if val is None:
+                await send("Введите ширину×длину, например 8.5×12")
+                return
+            data["total_area_m2"] = val
+            storage.set_wizard(user_id, "rooms", data)
+            await send("Отметьте комнаты:", keyboard=keyboards.rooms_keyboard(set()))
+            return
+
+        if step == "room_dims":
+            data = parse_room_sizes_step(data, text)
+            storage.set_wizard(user_id, "details", data)
             await send(
-                "Отметьте комнаты (можно несколько):",
-                keyboard=keyboards.rooms_keyboard(set()),
+                "Дополнительно (одним сообщением или «пропустить»):\n"
+                "• высота потолка (м)\n"
+                "• окна и двери (где)\n"
+                "• мокрые зоны\n"
+                "Пример: потолок 2.7; окно в гостиной на юг; стояк в ванной",
+                keyboard=keyboards.skip_keyboard("skip_details"),
             )
+            return
+
+        if step == "details":
+            if text.lower() not in {"пропустить", "skip", "-"}:
+                parts = text.split(";")
+                for part in parts:
+                    p = part.strip().lower()
+                    if "потол" in p:
+                        num = parse_area_value(part.split()[-1]) or parse_area_value(part)
+                        if num and num < 10:
+                            data["ceiling_height_m"] = num
+                    elif "мокр" in p or "стояк" in p or "ванн" in p:
+                        data["wet_zones"] = part.strip()
+                    elif "окн" in p or "двер" in p:
+                        data["openings_notes"] = (data.get("openings_notes", "") + "; " + part.strip()).strip("; ")
+            storage.set_wizard(user_id, "style", data)
+            await send("Выберите стиль:", keyboard=keyboards.style_keyboard())
+            return
+
+        if step == "style_notes":
+            if text.lower() not in {"пропустить", "skip", "-"}:
+                data["style_notes"] = text[:300]
+            storage.set_wizard(user_id, "budget", data)
+            await send("Бюджет на обстановку:", keyboard=keyboards.budget_keyboard())
+            return
+
+        if step == "furniture":
+            if text.lower() not in {"пропустить", "skip", "-"}:
+                data["furniture_wishes"] = text[:500]
+            ok, msg = check_area_mismatch(data)
+            if not ok:
+                storage.set_wizard(user_id, "area_fix", data)
+                await send(msg, keyboard=keyboards.area_fix_keyboard())
+                return
+            storage.set_wizard(user_id, "confirm", data)
+            await send(_summary(data), keyboard=keyboards.confirm_keyboard())
+            return
+
+        if step == "area_fix_total":
+            val = parse_area_value(text)
+            if val is None:
+                await send("Введите площадь, например 67.4")
+                return
+            data["total_area_m2"] = val
+            ok, msg = check_area_mismatch(data)
+            if not ok:
+                storage.set_wizard(user_id, "area_fix", data)
+                await send(msg, keyboard=keyboards.area_fix_keyboard())
+                return
+            storage.set_wizard(user_id, "confirm", data)
+            await send(_summary(data), keyboard=keyboards.confirm_keyboard())
+            return
+
+        if step == "area_fix_rooms":
+            data = parse_room_sizes_step(data, text)
+            ok, msg = check_area_mismatch(data)
+            if not ok:
+                storage.set_wizard(user_id, "area_fix", data)
+                await send(msg, keyboard=keyboards.area_fix_keyboard())
+                return
+            storage.set_wizard(user_id, "confirm", data)
+            await send(_summary(data), keyboard=keyboards.confirm_keyboard())
+            return
+
+        if step == "bp_edit_area":
+            val = parse_area_value(text)
+            if val is None:
+                await send("Введите площадь в м²")
+                return
+            data["total_area_m2"] = val
+            storage.set_wizard(user_id, "blueprint_review", data)
+            await send(blueprint_review_summary(data), keyboard=keyboards.blueprint_review_keyboard())
+            return
+
+        if step == "bp_edit_rooms":
+            data = parse_room_sizes_step(data, text)
+            storage.set_wizard(user_id, "blueprint_review", data)
+            await send(blueprint_review_summary(data), keyboard=keyboards.blueprint_review_keyboard())
+            return
+
+        if step == "bp_edit_details":
+            if text.lower() not in {"пропустить", "skip"}:
+                data["openings_notes"] = text[:300]
+            storage.set_wizard(user_id, "blueprint_review", data)
+            await send(blueprint_review_summary(data), keyboard=keyboards.blueprint_review_keyboard())
             return
 
         if step == "single_room_name":
@@ -384,13 +538,142 @@ def setup_handlers(bot, storage: Storage, grok: GrokClient, cfg: dict) -> None:
                 data["rooms"] = [{"name": "Комната", "room_type": "other"}]
                 storage.set_wizard(user_id, "single_room_name", data)
                 await _send(api, peer_id, "Как называется комната? (напишите текстом)")
-            elif ptype == "house":
-                data["floors"] = 2
-                storage.set_wizard(user_id, "area", data)
-                await _send(api, peer_id, "Примерная площадь дома:", keyboards.area_keyboard())
             else:
+                if ptype == "house":
+                    data["floors"] = 2
+                storage.set_wizard(user_id, "input_source", data)
+                await _send(
+                    api,
+                    peer_id,
+                    "Есть чертёж квартиры/дома или введёте размеры вручную?",
+                    keyboards.input_source_keyboard(),
+                )
+            return
+
+        if cmd == "input_source":
+            await ack()
+            mode = payload.get("value", "manual")
+            if mode == "blueprint":
+                data["input_mode"] = "blueprint"
+                data["blueprint_pending_files"] = []
+                upload_dir = WIZARD_UPLOAD_ROOT / user_id
+                if upload_dir.is_dir():
+                    for f in upload_dir.iterdir():
+                        f.unlink(missing_ok=True)
+                storage.set_wizard(user_id, "blueprint_upload", data)
+                await _send(
+                    api,
+                    peer_id,
+                    "📎 Пришлите чертёж: фото, PDF, PNG, SVG, DXF и др.\n"
+                    "Можно несколько файлов (по этажам). Затем «Готово, распознать».",
+                    keyboards.blueprint_upload_keyboard(),
+                )
+            else:
+                data["input_mode"] = "manual"
                 storage.set_wizard(user_id, "area", data)
-                await _send(api, peer_id, "Примерная площадь квартиры:", keyboards.area_keyboard())
+                label = "дома" if data.get("project_type") == "house" else "квартиры"
+                await _send(api, peer_id, f"Площадь {label}:", keyboards.area_keyboard())
+            return
+
+        if cmd == "blueprint_more":
+            await ack()
+            await _send(
+                api,
+                peer_id,
+                "Пришлите следующий файл (этаж) в чат.",
+                keyboards.blueprint_upload_keyboard(),
+            )
+            return
+
+        if cmd == "blueprint_parse":
+            await ack()
+            await _send(api, peer_id, "⏳ Распознаю чертёж…")
+            try:
+                data = await _parse_blueprints(grok, user_id, data)
+            except Exception as exc:
+                LOGGER.exception("Blueprint parse: %s", exc)
+                await _send(api, peer_id, f"Не удалось распознать: {exc}")
+                return
+            if not data.get("rooms"):
+                await _send(
+                    api,
+                    peer_id,
+                    "Комнаты не найдены. Пришлите более чёткий чертёж или введите вручную.",
+                    keyboards.input_source_keyboard(),
+                )
+                return
+            storage.set_wizard(user_id, "blueprint_review", data)
+            await _send(api, peer_id, blueprint_review_summary(data), keyboards.blueprint_review_keyboard())
+            return
+
+        if cmd == "blueprint_confirm":
+            await ack()
+            storage.set_wizard(user_id, "style", data)
+            await _send(api, peer_id, "Выберите стиль интерьера:", keyboards.style_keyboard())
+            return
+
+        if cmd == "bp_edit":
+            await ack()
+            field = payload.get("field", "area")
+            if field == "area":
+                storage.set_wizard(user_id, "bp_edit_area", data)
+                await _send(api, peer_id, "Введите площадь в м² (число или Ш×Д):")
+            elif field == "rooms":
+                storage.set_wizard(user_id, "bp_edit_rooms", data)
+                rooms = ", ".join(r.get("name", "?") for r in data.get("rooms") or [])
+                await _send(
+                    api,
+                    peer_id,
+                    f"Укажите размеры комнат (по строке):\n{rooms}\n"
+                    "Пример:\nСпальня 3.2x4.5\nКухня 12",
+                )
+            else:
+                storage.set_wizard(user_id, "bp_edit_details", data)
+                await _send(api, peer_id, "Опишите потолок, окна, двери, мокрые зоны:")
+            return
+
+        if cmd == "area_mode":
+            await ack()
+            mode = payload.get("value", "custom")
+            if mode == "dims":
+                storage.set_wizard(user_id, "area_dims_input", data)
+                await _send(api, peer_id, "Введите ширину×длину в метрах, например 8.5×12")
+            else:
+                storage.set_wizard(user_id, "area_input", data)
+                await _send(api, peer_id, "Введите площадь в м², например 67.4")
+            return
+
+        if cmd == "skip_details":
+            await ack()
+            storage.set_wizard(user_id, "style", data)
+            await _send(api, peer_id, "Выберите стиль:", keyboards.style_keyboard())
+            return
+
+        if cmd == "skip_step":
+            await ack()
+            storage.set_wizard(user_id, "confirm", data)
+            await _send(api, peer_id, _summary(data), keyboards.confirm_keyboard())
+            return
+
+        if cmd == "style_custom":
+            await ack()
+            storage.set_wizard(user_id, "style_notes", data)
+            await _send(api, peer_id, "Опишите желаемый стиль своими словами (или «пропустить»):")
+            return
+
+        if cmd == "area_fix":
+            await ack()
+            target = payload.get("target", "total")
+            if target == "rooms":
+                storage.set_wizard(user_id, "area_fix_rooms", data)
+                await _send(
+                    api,
+                    peer_id,
+                    "Укажите размеры комнат построчно, например:\nСпальня 3.2x4.5\nКухня 12",
+                )
+            else:
+                storage.set_wizard(user_id, "area_fix_total", data)
+                await _send(api, peer_id, "Введите правильную общую площадь в м²:")
             return
 
         if cmd == "area":
@@ -427,13 +710,43 @@ def setup_handlers(bot, storage: Storage, grok: GrokClient, cfg: dict) -> None:
             data["rooms"] = [
                 {"name": ROOM_NAMES.get(k, k), "room_type": k} for k in selected
             ]
-            storage.set_wizard(user_id, "style", data)
-            await _send(api, peer_id, "Выберите стиль:", keyboards.style_keyboard())
+            storage.set_wizard(user_id, "room_dims", data)
+            rooms = ", ".join(r["name"] for r in data["rooms"])
+            await _send(
+                api,
+                peer_id,
+                f"Размеры комнат (необязательно).\n{rooms}\n"
+                "Построчно: «Спальня 3.2x4.5» или «Кухня 12 м²».\n"
+                "Или нажмите «Пропустить».",
+                keyboards.skip_keyboard("skip_room_dims"),
+            )
+            return
+
+        if cmd == "skip_room_dims":
+            await ack()
+            storage.set_wizard(user_id, "details", data)
+            await _send(
+                api,
+                peer_id,
+                "Дополнительно (потолок, окна, двери, мокрые зоны) — текстом или «пропустить»:",
+                keyboards.skip_keyboard("skip_details"),
+            )
             return
 
         if cmd == "style":
             await ack()
             data["style"] = payload.get("value", "scandinavian")
+            storage.set_wizard(user_id, "style_notes", data)
+            await _send(
+                api,
+                peer_id,
+                "Уточните стиль текстом (необязательно) или «пропустить»:",
+                keyboards.skip_keyboard("skip_style_notes"),
+            )
+            return
+
+        if cmd == "skip_style_notes":
+            await ack()
             storage.set_wizard(user_id, "budget", data)
             await _send(api, peer_id, "Бюджет на обстановку:", keyboards.budget_keyboard())
             return
@@ -441,6 +754,24 @@ def setup_handlers(bot, storage: Storage, grok: GrokClient, cfg: dict) -> None:
         if cmd == "budget":
             await ack()
             data["budget_tier"] = payload.get("value", "medium")
+            storage.set_wizard(user_id, "furniture", data)
+            await _send(
+                api,
+                peer_id,
+                "Пожелания по мебели и расстановке (необязательно):\n"
+                "Например: «кровать у окна, без ТВ».\n"
+                "Или «пропустить».",
+                keyboards.skip_keyboard("skip_furniture"),
+            )
+            return
+
+        if cmd == "skip_furniture":
+            await ack()
+            ok, msg = check_area_mismatch(data)
+            if not ok:
+                storage.set_wizard(user_id, "area_fix", data)
+                await _send(api, peer_id, msg, keyboards.area_fix_keyboard())
+                return
             storage.set_wizard(user_id, "confirm", data)
             await _send(api, peer_id, _summary(data), keyboards.confirm_keyboard())
             return

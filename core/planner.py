@@ -52,12 +52,16 @@ def brief_from_wizard(data: dict[str, Any]) -> ProjectBrief:
             rt = RoomType(r.get("room_type", "other"))
         except ValueError:
             rt = RoomType.OTHER
+        w, l, a = r.get("width_m"), r.get("length_m"), r.get("area_m2")
         rooms.append(
             RoomSpec(
                 name=r.get("name") or "Комната",
                 room_type=rt,
-                width_m=r.get("width_m"),
-                length_m=r.get("length_m"),
+                width_m=float(w) if w is not None else None,
+                length_m=float(l) if l is not None else None,
+                area_m2=float(a) if a is not None else None,
+                doors=list(r.get("doors") or []),
+                windows=list(r.get("windows") or []),
             )
         )
     try:
@@ -70,12 +74,25 @@ def brief_from_wizard(data: dict[str, Any]) -> ProjectBrief:
             area = float(area.replace(",", "."))
         except ValueError:
             area = None
+    ceiling = data.get("ceiling_height_m")
+    if isinstance(ceiling, str):
+        try:
+            ceiling = float(ceiling.replace(",", "."))
+        except ValueError:
+            ceiling = None
     return ProjectBrief(
         project_type=ptype,
         total_area_m2=area,
         rooms=rooms,
         style=data.get("style") or "scandinavian",
+        style_notes=data.get("style_notes") or "",
         budget_tier=data.get("budget_tier") or "medium",
         floors=int(data.get("floors") or 1),
         notes=data.get("notes") or "",
+        ceiling_height_m=ceiling,
+        openings_notes=data.get("openings_notes") or "",
+        wet_zones=data.get("wet_zones") or "",
+        furniture_wishes=data.get("furniture_wishes") or "",
+        blueprint_estimated=bool(data.get("blueprint_estimated")),
+        input_mode=data.get("input_mode") or "manual",
     )

@@ -156,6 +156,7 @@ async def _run_bot(cfg: dict) -> None:
         api_key=cfg.get("grok_api_key") or "",
         model=cfg.get("grok_model") or "grok-2-latest",
         url=cfg.get("grok_url") or "https://api.x.ai/v1/chat/completions",
+        image_model=cfg.get("grok_image_model") or "grok-imagine-image-2.0",
     )
     yookassa = cfg.get("yookassa_client")
     api, session = await _build_api(cfg["vk_token"])

@@ -62,7 +62,72 @@ def area_keyboard() -> str:
                     _cb("70–100", {"cmd": "area", "value": "85"}),
                     _cb("100+", {"cmd": "area", "value": "120"}),
                 ],
+                [_cb("✏️ Своё число", {"cmd": "area_mode", "value": "custom"}, "primary")],
+                [_cb("📐 Ширина × длина", {"cmd": "area_mode", "value": "dims"})],
                 [_cb("Пропустить", {"cmd": "area", "value": "skip"})],
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
+def input_source_keyboard() -> str:
+    return json.dumps(
+        {
+            "inline": True,
+            "buttons": [
+                [_cb("📎 Загрузить чертёж", {"cmd": "input_source", "value": "blueprint"}, "primary")],
+                [_cb("✏️ Ввести вручную", {"cmd": "input_source", "value": "manual"})],
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
+def blueprint_upload_keyboard() -> str:
+    return json.dumps(
+        {
+            "inline": True,
+            "buttons": [
+                [_cb("✅ Готово, распознать", {"cmd": "blueprint_parse"}, "positive")],
+                [_cb("➕ Ещё файл (этаж)", {"cmd": "blueprint_more"})],
+                [_cb("◀️ Назад", {"cmd": "restart"})],
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
+def blueprint_review_keyboard() -> str:
+    return json.dumps(
+        {
+            "inline": True,
+            "buttons": [
+                [_cb("✏️ Площадь", {"cmd": "bp_edit", "field": "area"})],
+                [_cb("✏️ Комнаты", {"cmd": "bp_edit", "field": "rooms"})],
+                [_cb("✏️ Потолок/окна", {"cmd": "bp_edit", "field": "details"})],
+                [_cb("✅ Подтвердить план", {"cmd": "blueprint_confirm"}, "positive")],
+                [_cb("🔄 Загрузить заново", {"cmd": "input_source", "value": "blueprint"})],
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
+def skip_keyboard(cmd: str = "skip_step") -> str:
+    return json.dumps(
+        {"inline": True, "buttons": [[_cb("Пропустить →", {"cmd": cmd})]]},
+        ensure_ascii=False,
+    )
+
+
+def area_fix_keyboard() -> str:
+    return json.dumps(
+        {
+            "inline": True,
+            "buttons": [
+                [_cb("✏️ Исправить площадь", {"cmd": "area_fix", "target": "total"}, "primary")],
+                [_cb("✏️ Исправить комнаты", {"cmd": "area_fix", "target": "rooms"})],
             ],
         },
         ensure_ascii=False,
@@ -91,7 +156,7 @@ def rooms_keyboard(selected: set[str]) -> str:
             row = []
     if row:
         rows.append(row)
-    rows.append([_cb("Готово → стиль", {"cmd": "rooms_done"}, "primary")])
+    rows.append([_cb("Готово → размеры", {"cmd": "rooms_done"}, "primary")])
     return json.dumps({"inline": True, "buttons": rows}, ensure_ascii=False)
 
 
@@ -112,6 +177,7 @@ def style_keyboard() -> str:
             row = []
     if row:
         rows.append(row)
+    rows.append([_cb("Свой стиль (текстом)", {"cmd": "style_custom"}, "secondary")])
     return json.dumps({"inline": True, "buttons": rows}, ensure_ascii=False)
 
 

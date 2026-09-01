@@ -24,28 +24,53 @@ def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def layout_to_png(layout: dict[str, Any], out_path: Path, size: int = 900) -> Path:
+def layout_to_png(
+    layout: dict[str, Any],
+    out_path: Path,
+    size: int = 1000,
+    *,
+    estimated: bool = False,
+) -> Path:
+    svg_text = layout_json_to_svg(layout, width=size, height=int(size * 0.78), estimated=estimated)
+    svg_path = out_path.with_suffix(".svg")
+    svg_path.write_text(svg_text, encoding="utf-8")
+
+    try:
+        import cairosvg
+
+        cairosvg.svg2png(bytestring=svg_text.encode("utf-8"), write_to=str(out_path))
+        return out_path
+    except Exception:
+        pass
+
+    # Fallback: Pillow отрисовка
     rooms = layout.get("rooms") or []
-    img = Image.new("RGB", (size, int(size * 0.75)), "#f8f6f2")
+    img = Image.new("RGB", (size, int(size * 0.78)), "#faf8f4")
     draw = ImageDraw.Draw(img)
-    font = _font(18)
-    title_font = _font(22)
-    draw.text((20, 12), "ПланДом — планировка", fill="#2d4a35", font=title_font)
-    ox, oy = 20, 50
-    pw, ph = size - 40, int(size * 0.75) - 70
+    font = _font(16)
+    title_font = _font(20)
+    draw.text((24, 14), "ПланДом — планировка", fill="#2d4a35", font=title_font)
+    if estimated:
+        draw.text((24, 40), "Оценочный план", fill="#a66b00", font=font)
+    ox, oy = 24, 70
+    pw, ph = size - 48, int(size * 0.78) - 90
     for room in rooms:
         x = ox + int(room.get("x", 0) / 100 * pw)
         y = oy + int(room.get("y", 0) / 100 * ph)
-        w = max(20, int(room.get("w", 20) / 100 * pw))
-        h = max(20, int(room.get("h", 20) / 100 * ph))
-        draw.rectangle([x, y, x + w, y + h], fill="#e8efe8", outline="#4a7c59", width=2)
-        name = (room.get("name") or "Комната")[:20]
-        draw.text((x + 6, y + h // 2 - 8), name, fill="#2d4a35", font=font)
+        w = max(24, int(room.get("w", 20) / 100 * pw))
+        h = max(24, int(room.get("h", 20) / 100 * ph))
+        draw.rectangle([x, y, x + w, y + h], fill="#eef4ee", outline="#2d4a35", width=2)
+        name = (room.get("name") or "Комната")[:18]
+        draw.text((x + 8, y + 8), name, fill="#2d4a35", font=font)
+        dim_parts = []
+        if room.get("width_m") and room.get("length_m"):
+            dim_parts.append(f"{room['width_m']}×{room['length_m']} м")
+        elif room.get("area_m2"):
+            dim_parts.append(f"{room['area_m2']} м²")
+        if dim_parts:
+            draw.text((x + 8, y + h - 24), dim_parts[0], fill="#5a6b5c", font=font)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path, format="PNG", optimize=True)
-    layout_json_to_svg(layout)  # keep svg_builder used; SVG saved optionally
-    svg_path = out_path.with_suffix(".svg")
-    svg_path.write_text(layout_json_to_svg(layout), encoding="utf-8")
     return out_path
 
 
