@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import asyncio
 import logging
 from typing import Any
 
@@ -84,6 +85,9 @@ async def upload_photo_to_messages(
             if not upload_url:
                 LOGGER.warning("No upload_url for peer=%s", peer_id)
                 return None
+
+            if attempt > 1:
+                await asyncio.sleep(0.5)
 
             jpeg = _jpeg_bytes(image_bytes, quality=quality)
             async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:

@@ -19,8 +19,9 @@ from vkbottle.bot import Message, MessageEvent
 from core.image_gen import render_room_card
 from core.models import ProjectType, RoomSpec, RoomType
 from core.planner import brief_from_wizard, build_layout
-from core.room_render import render_room_images
+from core.room_render import render_room_images, views_for_tier
 from core.render import add_watermark, build_pdf, layout_to_png, png_bytes
+from core.image_normalize import normalize_image_bytes
 from core.dimensions import parse_area_value
 from core.blueprint_service import recognize_blueprint_files
 from grok_client import GrokClient
@@ -28,6 +29,7 @@ from storage import Storage
 from vk import keyboards
 from vk.attachments import save_message_attachments
 from vk.media import upload_doc_to_messages, upload_photo_to_messages
+from vk.progress import GenerationProgress
 from vk.wizard_flow import (
     apply_blueprint_to_wizard,
     blueprint_review_summary,
@@ -114,6 +116,25 @@ async def _parse_blueprints(
     return apply_blueprint_to_wizard(data, parsed)
 
 
+async def _send_attachment(
+    api,
+    peer_id: int,
+    text: str,
+    attachment: str,
+    *,
+    keyboard: str | None = None,
+) -> None:
+    params: dict = {
+        "peer_id": int(peer_id),
+        "message": text,
+        "attachment": attachment,
+        "random_id": random.randint(1, 2_000_000_000),
+    }
+    if keyboard:
+        params["keyboard"] = keyboard
+    await api.request("messages.send", params)
+
+
 async def _run_generation(
     api,
     storage: Storage,
@@ -138,110 +159,150 @@ async def _run_generation(
     out_dir.mkdir(parents=True, exist_ok=True)
     storage.create_project(project_id, user_id, brief.to_dict(), tier=tier, output_dir=str(out_dir))
 
-    await _send(api, peer_id, "⏳ Строю планировку и обставляю комнаты…")
-
-    layout = await build_layout(brief, grok)
-    if brief.total_area_m2:
-        layout["total_area_m2"] = brief.total_area_m2
-    storage.update_project(project_id, layout=layout)
-
-    plan_path = layout_to_png(
-        layout,
-        out_dir / "plan.png",
-        estimated=bool(data.get("blueprint_estimated")),
-    )
-    attachments: list[str] = []
-    plan_att = await upload_photo_to_messages(api, peer_id, png_bytes(plan_path), group_id=group_id)
-    if plan_att:
-        attachments.append(plan_att)
-
-    is_full = tier in ("pro", "full")
-    is_pro = tier == "pro"
-    room_items_pdf: list[tuple[str, Path, str]] = []
+    progress = GenerationProgress(api, peer_id, group_id)
+    await progress.start("⏳ Строю планировку", activity="typing")
     upload_warnings: list[str] = []
-
-    for i, room in enumerate(layout.get("rooms") or []):
-        name = room.get("name") or f"Комната {i + 1}"
-        desc = await grok.describe_room(room, brief.to_dict())
-        hd_room = tier in ("pro", "full") or (tier == "free" and i == 0)
-        image_paths = await render_room_images(
-            grok,
-            room,
-            brief.to_dict(),
-            desc,
-            out_dir,
-            i + 1,
-            pro_variants=is_pro,
-        )
-        room_uploaded = 0
-        for card_path in image_paths:
-            if not hd_room:
-                add_watermark(card_path)
-            att = await upload_photo_to_messages(api, peer_id, png_bytes(card_path), group_id=group_id)
-            if att:
-                attachments.append(att)
-                room_uploaded += 1
-            else:
-                LOGGER.warning("VK upload failed: room=%s file=%s", name, card_path.name)
-            await asyncio.sleep(1.2)
-        if image_paths:
-            room_items_pdf.append((name, image_paths[0], desc))
-        if image_paths and room_uploaded == 0:
-            upload_warnings.append(f"⚠️ Не удалось загрузить фото: {name}")
-
+    pdf_att: str | None = None
     pdf_path = out_dir / "project.pdf"
-    include_pdf = tier in ("pro", "full") or is_full
-    msg_lines = ["✅ Проект готов!\n"]
-    room_names = [
-        r.get("name") or f"Комната {i + 1}"
-        for i, r in enumerate(layout.get("rooms") or [])
-    ]
-    if room_names:
-        msg_lines.append("Комнаты: " + ", ".join(room_names))
-    msg_lines.extend(upload_warnings)
 
-    if tier == "full":
-        storage.consume_project_payment(user_id, project_id)
-    elif tier == "free":
-        storage.mark_free_trial_used(user_id)
-        msg_lines.append("🎁 Бесплатный пробный: 1 комната в HD, остальные с watermark.")
-        msg_lines.append("Для полного проекта и PDF — оплатите тариф ниже.")
-    elif tier == "pro":
-        storage.increment_pro_project(user_id)
-        include_pdf = True
-        msg_lines.append("⭐ PRO: полный проект без ограничений.")
-    elif tier == "preview":
-        msg_lines.append("Пробный период использован. Полный результат — по тарифу.")
-    else:
-        include_pdf = True
+    try:
+        layout = await build_layout(brief, grok)
+        if brief.total_area_m2:
+            layout["total_area_m2"] = brief.total_area_m2
+        storage.update_project(project_id, layout=layout)
 
-    if include_pdf and room_items_pdf:
-        build_pdf(plan_path, room_items_pdf, pdf_path, title=f"ПланДом — {brief.project_type.value}")
-        pdf_att = await upload_doc_to_messages(
-            api, peer_id, pdf_path.read_bytes(), "plandom-project.pdf", group_id=group_id
+        plan_path = layout_to_png(
+            layout,
+            out_dir / "plan.png",
+            estimated=bool(data.get("blueprint_estimated")),
         )
+
+        await progress.set_phase("📤 Загружаю план", activity="upload")
+        plan_att = await upload_photo_to_messages(
+            api, peer_id, normalize_image_bytes(png_bytes(plan_path)), group_id=group_id
+        )
+        if plan_att:
+            await _send_attachment(api, peer_id, "📐 Планировка квартиры", plan_att)
+        else:
+            upload_warnings.append("⚠️ Не удалось загрузить план в VK")
+
+        is_full = tier in ("pro", "full")
+        room_items_pdf: list[tuple[str, Path, str]] = []
+        brief_dict = brief.to_dict()
+        design_palette = f"{brief.style} {brief.style_notes or ''}, budget {brief.budget_tier}".strip()
+        rooms = layout.get("rooms") or []
+        total_rooms = len(rooms)
+
+        await progress.set_phase("✍️ Описываю комнаты", activity="typing")
+        descriptions = list(
+            await asyncio.gather(*[grok.describe_room(room, brief_dict) for room in rooms])
+        )
+
+        for i, room in enumerate(rooms):
+            name = room.get("name") or f"Комната {i + 1}"
+            desc = descriptions[i] if i < len(descriptions) else ""
+            hd_room = tier in ("pro", "full") or (tier == "free" and i == 0)
+            room_views = views_for_tier(tier, room_index=i, is_hd=hd_room)
+
+            await progress.set_phase(
+                f"🎨 {name} ({i + 1}/{total_rooms}): генерирую интерьер",
+                activity="image",
+            )
+            await _send(
+                api,
+                peer_id,
+                f"📍 {name} ({i + 1}/{total_rooms}) — {len(room_views)} "
+                f"{'ракурс' if len(room_views) == 1 else 'ракурса'} одного интерьера",
+            )
+
+            labeled_images = await render_room_images(
+                grok,
+                room,
+                brief_dict,
+                desc,
+                out_dir,
+                i + 1,
+                views=room_views,
+                design_palette=design_palette,
+            )
+            room_uploaded = 0
+            for card_path, caption in labeled_images:
+                if not hd_room:
+                    add_watermark(card_path)
+                await progress.set_phase(
+                    f"📤 {name}: загружаю фото ({room_uploaded + 1}/{len(labeled_images)})",
+                    activity="upload",
+                )
+                att = await upload_photo_to_messages(
+                    api, peer_id, png_bytes(card_path), group_id=group_id
+                )
+                if att:
+                    await _send_attachment(api, peer_id, caption, att)
+                    room_uploaded += 1
+                else:
+                    LOGGER.warning("VK upload failed: room=%s file=%s", name, card_path.name)
+                await asyncio.sleep(0.8)
+            if labeled_images:
+                room_items_pdf.append((name, labeled_images[0][0], desc))
+            if labeled_images and room_uploaded == 0:
+                upload_warnings.append(f"⚠️ Не удалось загрузить фото: {name}")
+
+        include_pdf = tier in ("pro", "full") or is_full
+        msg_lines = ["✅ Проект готов!\n"]
+        room_names = [
+            r.get("name") or f"Комната {j + 1}"
+            for j, r in enumerate(rooms)
+        ]
+        if room_names:
+            msg_lines.append("Комнаты: " + ", ".join(room_names))
+        msg_lines.append(
+            "К каждому фото — подпись с названием комнаты и номером ракурса."
+        )
+        msg_lines.extend(upload_warnings)
+
+        if tier == "full":
+            storage.consume_project_payment(user_id, project_id)
+        elif tier == "free":
+            storage.mark_free_trial_used(user_id)
+            msg_lines.append("🎁 Бесплатный пробный: 1 комната в HD, остальные с watermark.")
+            msg_lines.append("Для полного проекта и PDF — оплатите тариф ниже.")
+        elif tier == "pro":
+            storage.increment_pro_project(user_id)
+            include_pdf = True
+            msg_lines.append("⭐ PRO: полный проект без ограничений.")
+        elif tier == "preview":
+            msg_lines.append("Пробный период использован. Полный результат — по тарифу.")
+        else:
+            include_pdf = True
+
+        if include_pdf and room_items_pdf:
+            build_pdf(plan_path, room_items_pdf, pdf_path, title=f"ПланДом — {brief.project_type.value}")
+            pdf_att = await upload_doc_to_messages(
+                api, peer_id, pdf_path.read_bytes(), "plandom-project.pdf", group_id=group_id
+            )
+            if pdf_att:
+                msg_lines.append("📄 PDF прикреплён к сообщению.")
+        elif not include_pdf:
+            msg_lines.append("📄 PDF доступен после оплаты полного проекта.")
+
+        storage.update_project(project_id, status="done", tier=tier)
+        storage.clear_wizard(user_id)
+
+        params: dict = {
+            "peer_id": peer_id,
+            "message": "\n".join(msg_lines),
+            "random_id": random.randint(1, 2_000_000_000),
+        }
         if pdf_att:
-            attachments.append(pdf_att)
-            msg_lines.append("📄 PDF прикреплён к сообщению.")
-    elif not include_pdf:
-        msg_lines.append("📄 PDF доступен после оплаты полного проекта.")
-
-    storage.update_project(project_id, status="done", tier=tier)
-    storage.clear_wizard(user_id)
-
-    params: dict = {
-        "peer_id": peer_id,
-        "message": "\n".join(msg_lines),
-        "random_id": random.randint(1, 2_000_000_000),
-    }
-    if attachments:
-        params["attachment"] = ",".join(attachments)
-    if tier in ("free", "preview"):
-        pay_type = (
-            "project_house" if brief.project_type == ProjectType.HOUSE else "project_apartment"
-        )
-        params["keyboard"] = keyboards.pay_keyboard(project_id, pay_type)
-    await api.request("messages.send", params)
+            params["attachment"] = pdf_att
+        if tier in ("free", "preview"):
+            pay_type = (
+                "project_house" if brief.project_type == ProjectType.HOUSE else "project_apartment"
+            )
+            params["keyboard"] = keyboards.pay_keyboard(project_id, pay_type)
+        await api.request("messages.send", params)
+    finally:
+        await progress.stop()
 
 
 def setup_handlers(bot, storage: Storage, grok: GrokClient, cfg: dict) -> None:
@@ -799,7 +860,15 @@ def setup_handlers(bot, storage: Storage, grok: GrokClient, cfg: dict) -> None:
 
         if cmd == "generate":
             await ack()
-            await _run_generation(api, storage, grok, cfg, user_id, peer_id, data)
+
+            async def _safe_gen() -> None:
+                try:
+                    await _run_generation(api, storage, grok, cfg, user_id, peer_id, data)
+                except Exception as exc:
+                    LOGGER.exception("Generation failed: %s", exc)
+                    await _send(api, peer_id, f"❌ Ошибка генерации: {exc}")
+
+            asyncio.create_task(_safe_gen())
             return
 
         if cmd == "pay":

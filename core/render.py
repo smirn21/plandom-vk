@@ -97,6 +97,30 @@ def add_watermark(image_path: Path, label: str = "ПланДом — превь�
     return image_path
 
 
+def _register_pdf_fonts() -> tuple[str, str]:
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    pairs = (
+        (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ),
+        (
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        ),
+    )
+    for regular, bold in pairs:
+        try:
+            pdfmetrics.registerFont(TTFont("PlandomRegular", regular))
+            pdfmetrics.registerFont(TTFont("PlandomBold", bold))
+            return "PlandomRegular", "PlandomBold"
+        except OSError:
+            continue
+    return "Helvetica", "Helvetica-Bold"
+
+
 def build_pdf(
     plan_path: Path,
     room_items: list[tuple[str, Path, str]],
@@ -107,13 +131,14 @@ def build_pdf(
     from reportlab.lib.units import cm
     from reportlab.pdfgen import canvas
 
+    font_regular, font_bold = _register_pdf_fonts()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     c = canvas.Canvas(str(out_path), pagesize=A4)
     w, h = A4
 
-    c.setFont("Helvetica-Bold", 18)
+    c.setFont(font_bold, 18)
     c.drawString(2 * cm, h - 2 * cm, title)
-    c.setFont("Helvetica", 11)
+    c.setFont(font_regular, 11)
     c.drawString(2 * cm, h - 2.8 * cm, "Сгенерировано ботом ПланДом")
 
     if plan_path.is_file():
@@ -121,11 +146,11 @@ def build_pdf(
     c.showPage()
 
     for room_name, img_path, description in room_items:
-        c.setFont("Helvetica-Bold", 16)
+        c.setFont(font_bold, 16)
         c.drawString(2 * cm, h - 2 * cm, room_name)
         if img_path.is_file():
             c.drawImage(str(img_path), 2 * cm, h - 12 * cm, width=14 * cm, height=9 * cm, preserveAspectRatio=True)
-        c.setFont("Helvetica", 10)
+        c.setFont(font_regular, 10)
         y = h - 13.5 * cm
         for line in textwrap.wrap(description or "", width=90):
             c.drawString(2 * cm, y, line)

@@ -374,6 +374,9 @@ class GrokClient:
         description: str,
         *,
         view: str,
+        view_index: int = 1,
+        views_total: int = 1,
+        design_palette: str = "",
     ) -> str:
         style = brief.get("style", "scandinavian")
         style_notes = brief.get("style_notes") or ""
@@ -394,15 +397,21 @@ class GrokClient:
         }
         view_line = view_map.get(view, view_map["entrance"])
         wishes = brief.get("furniture_wishes") or ""
+        palette = design_palette or f"{style} {style_notes}, {budget} budget"
+        consistency = (
+            f"SAME interior design session — view {view_index} of {views_total} of ONE room. "
+            "Identical furniture layout, wall colors, floor material, and decor in all views; "
+            "only camera position changes."
+        )
         return (
             f"Professional interior design photography by an award-winning designer. "
             f"Room: {name}. Room type: {room_type}. Required elements: {type_hint}. "
-            f"Style: {style} {style_notes}. Budget tier: {budget}. Size: {size}. "
-            f"Ceiling height {ceiling}m. {view_line}. "
+            f"Unified palette: {palette}. Size: {size}. Ceiling height {ceiling}m. {view_line}. "
             f"Designer brief: {description}. Client wishes: {wishes}. "
-            f"CRITICAL: image must clearly be a {name} ({room_type}), not another room type. "
-            "Photorealistic, magazine-quality, natural materials, soft daylight, "
-            "no people, no logos, no text, no watermarks, 8k detail."
+            f"{consistency} "
+            f"CRITICAL: must be {name} ({room_type}), not another room. "
+            "Photorealistic, magazine-quality, cohesive design, soft daylight, "
+            "no people, no logos, no text, no watermarks."
         )
 
     def _image_model_candidates(self) -> list[str]:
@@ -466,10 +475,21 @@ class GrokClient:
         *,
         view: str = "entrance",
         quality: str = "medium",
+        view_index: int = 1,
+        views_total: int = 1,
+        design_palette: str = "",
     ) -> bytes | None:
         if not self.api_key:
             return None
-        prompt = self._interior_prompt(room, brief, description, view=view)
+        prompt = self._interior_prompt(
+            room,
+            brief,
+            description,
+            view=view,
+            view_index=view_index,
+            views_total=views_total,
+            design_palette=design_palette,
+        )
         last_error = ""
         for model in self._image_model_candidates():
             for payload in self._image_payload_variants(model, prompt, quality=quality):
