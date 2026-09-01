@@ -42,6 +42,7 @@ def get_config() -> dict:
         "grok_api_key": (os.getenv("GROK_API_KEY") or "").strip(),
         "grok_model": (os.getenv("GROK_MODEL") or "grok-2-latest").strip(),
         "grok_image_model": (os.getenv("GROK_IMAGE_MODEL") or "grok-imagine-image-2.0").strip(),
+        "grok_image_api_url": (os.getenv("GROK_IMAGE_API_URL") or "").strip() or None,
         "grok_url": (
             os.getenv("GROK_API_URL") or "https://api.x.ai/v1/chat/completions"
         ).strip(),

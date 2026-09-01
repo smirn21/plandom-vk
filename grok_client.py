@@ -11,8 +11,13 @@ import httpx
 
 LOGGER = logging.getLogger(__name__)
 
-IMAGE_API = "https://api.x.ai/v1/images/generations"
+IMAGE_API_BASE = "https://api.x.ai/v1"
 DEFAULT_IMAGE_MODEL = "grok-imagine-image-2.0"
+IMAGE_MODEL_FALLBACKS = (
+    "grok-imagine-image-2.0",
+    "grok-imagine-image-quality",
+    "grok-imagine-image",
+)
 
 
 class GrokClient:
@@ -23,25 +28,39 @@ class GrokClient:
         url: str = "https://api.x.ai/v1/chat/completions",
         *,
         image_model: str = DEFAULT_IMAGE_MODEL,
+        image_api_url: str | None = None,
     ) -> None:
         self.api_key = api_key
         self.model = model
         self.url = url
         self.image_model = image_model
+        self.image_api_url = image_api_url or f"{IMAGE_API_BASE}/images/generations"
 
     @property
     def available(self) -> bool:
         return bool(self.api_key)
 
-    async def _post_json(self, url: str, payload: dict[str, Any], *, timeout: float = 120) -> dict[str, Any]:
+    async def _post_json(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        *,
+        timeout: float = 120,
+        raise_for_status: bool = True,
+    ) -> tuple[int, dict[str, Any] | str]:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            return response.json()
+            try:
+                body: dict[str, Any] | str = response.json()
+            except Exception:
+                body = response.text
+            if raise_for_status:
+                response.raise_for_status()
+            return response.status_code, body
 
     async def answer_text(
         self, user_text: str, system: str, *, max_tokens: int = 800
@@ -58,10 +77,13 @@ class GrokClient:
             "max_output_tokens": max_tokens,
         }
         data = await self._post_json(self.url, payload)
+        _, body = data
+        if not isinstance(body, dict):
+            raise RuntimeError(f"Unexpected Grok response: {body}")
         try:
-            return data["choices"][0]["message"]["content"].strip()
+            return body["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError(f"Unexpected Grok response: {data}") from exc
+            raise RuntimeError(f"Unexpected Grok response: {body}") from exc
 
     async def answer_vision(
         self,
@@ -88,11 +110,13 @@ class GrokClient:
             "temperature": 0.1,
             "max_output_tokens": max_tokens,
         }
-        data = await self._post_json(self.url, payload, timeout=150)
+        _, body = await self._post_json(self.url, payload, timeout=150)
+        if not isinstance(body, dict):
+            raise RuntimeError(f"Unexpected Grok vision response: {body}")
         try:
-            return data["choices"][0]["message"]["content"].strip()
+            return body["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError(f"Unexpected Grok vision response: {data}") from exc
+            raise RuntimeError(f"Unexpected Grok vision response: {body}") from exc
 
     @staticmethod
     def _extract_json(text: str) -> dict[str, Any]:
@@ -245,6 +269,56 @@ class GrokClient:
             "no people, no logos, no text, no watermarks, 8k detail."
         )
 
+    def _image_model_candidates(self) -> list[str]:
+        models: list[str] = []
+        for name in (self.image_model, *IMAGE_MODEL_FALLBACKS):
+            if name and name not in models:
+                models.append(name)
+        return models
+
+    @staticmethod
+    def _image_payload_variants(model: str, prompt: str, *, quality: str) -> list[dict[str, Any]]:
+        variants = [
+            {
+                "model": model,
+                "prompt": prompt,
+                "n": 1,
+                "aspect_ratio": "4:3",
+                "resolution": "2k",
+                "response_format": "b64_json",
+            },
+            {
+                "model": model,
+                "prompt": prompt,
+                "n": 1,
+                "aspect_ratio": "4:3",
+                "response_format": "b64_json",
+            },
+            {
+                "model": model,
+                "prompt": prompt,
+                "n": 1,
+            },
+        ]
+        if model == "grok-imagine-image-2.0":
+            variants[0]["quality"] = quality
+        return variants
+
+    async def _decode_image_response(self, data: dict[str, Any]) -> bytes | None:
+        items = data.get("data") or []
+        if not items:
+            return None
+        b64 = items[0].get("b64_json")
+        if b64:
+            return base64.b64decode(b64)
+        url = items[0].get("url")
+        if url:
+            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                return resp.content
+        return None
+
     async def generate_interior_image(
         self,
         room: dict[str, Any],
@@ -257,29 +331,31 @@ class GrokClient:
         if not self.api_key:
             return None
         prompt = self._interior_prompt(room, brief, description, view=view)
-        payload = {
-            "model": self.image_model,
-            "prompt": prompt,
-            "n": 1,
-            "aspect_ratio": "4:3",
-            "resolution": "2k",
-            "quality": quality,
-            "response_format": "b64_json",
-        }
-        try:
-            data = await self._post_json(IMAGE_API, payload, timeout=180)
-            items = data.get("data") or []
-            if not items:
-                return None
-            b64 = items[0].get("b64_json")
-            if b64:
-                return base64.b64decode(b64)
-            url = items[0].get("url")
-            if url:
-                async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-                    resp = await client.get(url)
-                    resp.raise_for_status()
-                    return resp.content
-        except Exception as exc:
-            LOGGER.warning("Grok image failed (%s): %s", view, exc)
+        last_error = ""
+        for model in self._image_model_candidates():
+            for payload in self._image_payload_variants(model, prompt, quality=quality):
+                try:
+                    status, body = await self._post_json(
+                        self.image_api_url,
+                        payload,
+                        timeout=180,
+                        raise_for_status=False,
+                    )
+                    if status == 200 and isinstance(body, dict):
+                        image = await self._decode_image_response(body)
+                        if image:
+                            if model != self.image_model:
+                                LOGGER.info("Grok image ok with model %s", model)
+                            return image
+                    err = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)[:300]
+                    last_error = f"HTTP {status} model={model}: {err}"
+                    LOGGER.debug("Grok image attempt failed: %s", last_error)
+                except Exception as exc:
+                    last_error = f"model={model}: {exc}"
+                    LOGGER.debug("Grok image attempt error: %s", last_error)
+        LOGGER.warning(
+            "Grok image failed (%s): %s. Проверьте Imagine API и биллинг на console.x.ai",
+            view,
+            last_error or "unknown",
+        )
         return None
