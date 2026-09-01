@@ -28,7 +28,7 @@ from grok_client import GrokClient
 from storage import Storage
 from vk import keyboards
 from vk.attachments import save_message_attachments
-from vk.media import upload_doc_to_messages, upload_photo_to_messages
+from vk.media import upload_doc_to_messages, upload_image_to_messages
 from vk.progress import GenerationProgress
 from vk.wizard_flow import (
     apply_blueprint_to_wizard,
@@ -178,8 +178,12 @@ async def _run_generation(
         )
 
         await progress.set_phase("📤 Загружаю план", activity="upload")
-        plan_att = await upload_photo_to_messages(
-            api, peer_id, normalize_image_bytes(png_bytes(plan_path)), group_id=group_id
+        plan_att = await upload_image_to_messages(
+            api,
+            peer_id,
+            normalize_image_bytes(png_bytes(plan_path)),
+            group_id=group_id,
+            doc_title="plan.jpg",
         )
         if plan_att:
             await _send_attachment(api, peer_id, "📐 Планировка квартиры", plan_att)
@@ -233,8 +237,12 @@ async def _run_generation(
                     f"📤 {name}: загружаю фото ({room_uploaded + 1}/{len(labeled_images)})",
                     activity="upload",
                 )
-                att = await upload_photo_to_messages(
-                    api, peer_id, png_bytes(card_path), group_id=group_id
+                att = await upload_image_to_messages(
+                    api,
+                    peer_id,
+                    png_bytes(card_path),
+                    group_id=group_id,
+                    doc_title=card_path.name,
                 )
                 if att:
                     await _send_attachment(api, peer_id, caption, att)
@@ -276,12 +284,15 @@ async def _run_generation(
             include_pdf = True
 
         if include_pdf and room_items_pdf:
+            await asyncio.sleep(2)
             build_pdf(plan_path, room_items_pdf, pdf_path, title=f"ПланДом — {brief.project_type.value}")
             pdf_att = await upload_doc_to_messages(
                 api, peer_id, pdf_path.read_bytes(), "plandom-project.pdf", group_id=group_id
             )
             if pdf_att:
                 msg_lines.append("📄 PDF прикреплён к сообщению.")
+            else:
+                upload_warnings.append("⚠️ Не удалось загрузить PDF в VK")
         elif not include_pdf:
             msg_lines.append("📄 PDF доступен после оплаты полного проекта.")
 

@@ -5,7 +5,7 @@ import io
 
 from PIL import Image
 
-MAX_VK_SIDE = 1280
+MAX_VK_SIDE = 960
 
 
 def normalize_image_bytes(image_bytes: bytes, *, quality: int = 82) -> bytes:
@@ -26,6 +26,6 @@ def normalize_image_bytes(image_bytes: bytes, *, quality: int = 82) -> bytes:
         quality=quality,
         optimize=False,
         progressive=False,
-        subsampling=2,
+        subsampling=0,
     )
     return buf.getvalue()

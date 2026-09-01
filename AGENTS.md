@@ -39,7 +39,8 @@ python scripts/setup_vk_community.py  # оформление сообществ�
 vk/main.py          → Long Poll, инициализация
 vk/handlers.py      → wizard, генерация, оплата
 vk/wizard_flow.py   → шаги мастера (площадь, комнаты, чертежи)
-vk/media.py         → загрузка фото/PDF в VK
+vk/media.py         → загрузка фото/PDF в VK (photo + doc fallback)
+vk/progress.py      → статус генерации, typing, точки
 vk/http_fix.py      → патч vkbottle+pydantic (Python 3.10)
 
 core/planner.py     → layout (Grok + grid fallback)
@@ -52,22 +53,26 @@ storage.py          → users, projects, payments
 
 ## Pipeline генерации
 
-1. Wizard → `ProjectBrief` (комнаты: спальня, санузел, гостиная…)
-2. `build_layout()` — Grok JSON + **merge** с brief (все комнаты обязательны)
+1. Wizard → `ProjectBrief` (все комнаты из wizard обязательны)
+2. `build_layout()` — Grok JSON + **merge** с brief (`core/planner.py`)
 3. `layout_to_png()` — SVG план с размерами
-4. Для **каждой** комнаты из layout:
-   - `describe_room()` — текст от проф. дизайнера (chat)
-   - `generate_interior_image()` × 2 ракурса (image)
-   - нормализация JPEG → upload в VK
-5. PDF (pro/full), watermark на free tier для комнат 2+
+4. Прогресс в чате: `vk/progress.py` (typing + статус с точками)
+5. Описания комнат — **параллельно** (`asyncio.gather`)
+6. Для **каждой** комнаты:
+   - `describe_room()` — дизайн-бриф (chat)
+   - **Ракурс 1** — `generate_interior_image()` (image)
+   - **Vision lock** — `lock_design_from_image()` фиксирует мебель/цвета
+   - **Ракурс 2** — image с `locked_layout` (та же расстановка)
+   - JPEG normalize → `upload_image_to_messages()` (photo, иначе doc)
+7. PDF с DejaVu-шрифтами (`core/render.py`), upload с retry
 
 ## Тарифы
 
 | Tier | Что получает пользователь |
 |---|---|
-| `free` | План + 1 комната HD, остальные с watermark |
-| `full` | Все комнаты HD + PDF |
-| `pro` | + 3-й ракурс на комнату |
+| `free` | План + 1 комната HD (2 ракурса), остальные с watermark (1 ракурс) |
+| `full` | Все комнаты HD (2 ракурса) + PDF |
+| `pro` | Как full, 2 ракурса на комнату |
 | `preview` | Только план после trial |
 
 ## Grok — промпты
@@ -80,19 +85,21 @@ storage.py          → users, projects, payments
 
 ## VK upload — известные проблемы
 
-- PNG от Grok/cairosvg VK часто отклоняет → конвертация в baseline JPEG
-- `core/image_normalize.py` — max 1280px, quality 82
-- На каждую попытку — **новый** upload URL (`photos.getMessagesUploadServer`)
-- Пауза 1.2с между загрузками
+- PNG/Grok JPEG VK часто отклоняет → `core/image_normalize.py` (960px, baseline JPEG)
+- **`upload_image_to_messages()`** — сначала photo, при пустом `photo` → **doc fallback**
+- PDF/doc: 3 попытки, пауза 2с перед PDF, лог `error_descr`
+- На каждую попытку — **новый** upload URL
+- Пауза между загрузками ~0.8–1.5с
 
 ## Частые баги и fixes
 
 | Симптом | Причина | Где смотреть |
 |---|---|---|
 | Chat 400/404 | Image-модель в GROK_MODEL | `.env`, `normalize_grok_models()` |
-| Долгий chat | Fallback по недоступным моделям | `refresh_chat_models()`, приоритет API list |
-| Нет спальни на фото | Grok вернул < N комнат или VK upload fail | `core/planner.py` merge, логи `vk.media` |
-| План без фото | Пустой `photo` от VK upload | `vk/media.py`, JPEG normalize |
+| Фото не доходят | Пустой `photo` от VK | `upload_image_to_messages`, doc fallback |
+| PDF не приходит | Ошибка doc upload после многих фото | `vk/media.py`, retry + sleep |
+| Ракурсы «разные» | Независимая генерация | `lock_design_from_image()` |
+| Кракozябры в PDF | Helvetica без кириллицы | `_register_pdf_fonts()` в render.py |
 | pydantic crash | vkbottle messages.send | `vk/http_fix.py` |
 
 ## Документация
@@ -108,8 +115,9 @@ storage.py          → users, projects, payments
 
 ## Правила для AI-агента
 
-1. Минимальный diff, не трогать несвязанный код
-2. Не коммитить без явной просьбы пользователя
-3. Не пушить без просьбы
-4. После правок Grok/VK — напомнить обновить `.env` на сервере
-5. Тестировать: `./vk/run.sh` и прогон wizard с 3 комнатами
+1. **Читать и обновлять этот файл** при значимых изменениях (pipeline, upload, модели, тарифы)
+2. Минимальный diff, не трогать несвязанный код
+3. Не коммитить без явной просьбы пользователя
+4. Не пушить без просьбы
+5. После правок Grok/VK — напомнить обновить `.env` на сервере
+6. Тестировать: `./vk/run.sh` и прогон wizard с 3+ комнатами

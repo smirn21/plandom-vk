@@ -367,6 +367,36 @@ class GrokClient:
             LOGGER.warning("Grok room description failed: %s", exc)
             return f"{name}: {style} интерьер, бюджет {budget}."
 
+    async def lock_design_from_image(self, image_bytes: bytes, room_name: str) -> str:
+        """Фиксирует расстановку мебели с первого ракурса для второго."""
+        if not self.api_key:
+            return ""
+        import base64
+
+        jpeg = image_bytes
+        try:
+            from core.image_normalize import normalize_image_bytes
+
+            jpeg = normalize_image_bytes(image_bytes, quality=85)
+        except Exception:
+            pass
+        uri = f"data:image/jpeg;base64,{base64.b64encode(jpeg).decode()}"
+        system = (
+            "Ты профессиональный дизайнер интерьеров. По фото комнаты составь "
+            "ТОЧНОЕ описание для повторной генерации с другого ракурса: "
+            "каждый предмет мебели, цвет стен, пол, текстуры, освещение, декор. "
+            "Пиши на английском, списком, без markdown."
+        )
+        prompt = (
+            f"Room: {room_name}. Describe EXACT layout so a second camera angle "
+            "shows the SAME furniture in the SAME positions and colors."
+        )
+        try:
+            return await self.answer_vision(uri, prompt, system, max_tokens=500)
+        except Exception as exc:
+            LOGGER.warning("Design lock vision failed: %s", exc)
+            return ""
+
     def _interior_prompt(
         self,
         room: dict[str, Any],
@@ -377,6 +407,7 @@ class GrokClient:
         view_index: int = 1,
         views_total: int = 1,
         design_palette: str = "",
+        locked_layout: str = "",
     ) -> str:
         style = brief.get("style", "scandinavian")
         style_notes = brief.get("style_notes") or ""
@@ -403,12 +434,13 @@ class GrokClient:
             "Identical furniture layout, wall colors, floor material, and decor in all views; "
             "only camera position changes."
         )
+        locked = f" LOCKED LAYOUT FROM REFERENCE VIEW: {locked_layout}." if locked_layout else ""
         return (
             f"Professional interior design photography by an award-winning designer. "
             f"Room: {name}. Room type: {room_type}. Required elements: {type_hint}. "
             f"Unified palette: {palette}. Size: {size}. Ceiling height {ceiling}m. {view_line}. "
             f"Designer brief: {description}. Client wishes: {wishes}. "
-            f"{consistency} "
+            f"{consistency}{locked} "
             f"CRITICAL: must be {name} ({room_type}), not another room. "
             "Photorealistic, magazine-quality, cohesive design, soft daylight, "
             "no people, no logos, no text, no watermarks."
@@ -478,6 +510,7 @@ class GrokClient:
         view_index: int = 1,
         views_total: int = 1,
         design_palette: str = "",
+        locked_layout: str = "",
     ) -> bytes | None:
         if not self.api_key:
             return None
@@ -489,6 +522,7 @@ class GrokClient:
             view_index=view_index,
             views_total=views_total,
             design_palette=design_palette,
+            locked_layout=locked_layout,
         )
         last_error = ""
         for model in self._image_model_candidates():
