@@ -3,3 +3,5 @@ httpx>=0.27
 python-dotenv>=1.0
 aiohttp>=3.9
 certifi
+Pillow>=10.0
+reportlab>=4.0

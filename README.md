@@ -5,18 +5,22 @@
 
 ## Статус
 
-**MVP / проектирование.** Каркас репозитория и документация. Код бота — следующий этап
-после ответов на вопросы в [docs/PRODUCT.md](docs/PRODUCT.md).
+**MVP** — рабочий VK-бот: wizard → планировка → PNG комнат → PDF (в платных тарифах), ЮKassa.
 
-## Быстрый старт (когда будет реализовано)
+## Быстрый старт
 
 ```bash
 cd planirovka-vk
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env   # заполнить ключи
-python -m vk.main
+cp .env.example .env   # VK_BOT_TOKEN, VK_GROUP_ID, GROK_API_KEY, YOOKASSA_*
+./vk/run.sh
+```
+
+Или вручную:
+
+```bash
+python3 -m venv vk/.venv
+vk/.venv/bin/pip install -r requirements.txt
+vk/.venv/bin/python -m vk.main
 ```
 
 ## Структура
@@ -29,6 +33,16 @@ planirovka-vk/
 ├── storage.py      SQLite / Postgres
 ├── yookassa_client.py
 └── requirements.txt
+```
+
+## Настройка VK-сообщества
+
+```bash
+# 1. Положите VK_USER_TOKEN в .env (права: groups, photos, wall)
+python3 scripts/generate_vk_assets.py
+python3 scripts/setup_vk_community.py
+# 2. Выпустите токен бота: ссылка из скрипта → act=tokens → сообщения, фото, docs
+# 3. VK_BOT_TOKEN=... в .env, ./vk/run.sh
 ```
 
 ## Документация
