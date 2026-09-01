@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import re
+import time
 from typing import Any
 
 import httpx
@@ -101,7 +102,12 @@ class GrokClient:
         *,
         timeout: float = 120,
         raise_for_status: bool = True,
+        op: str = "grok",
     ) -> tuple[int, dict[str, Any] | str]:
+        model = payload.get("model", "?")
+        LOGGER.info("Grok %s → %s model=%s timeout=%ss", op, url.rsplit("/", 1)[-1], model, timeout)
+        LOGGER.debug("Grok %s payload keys: %s", op, list(payload.keys()))
+        t0 = time.monotonic()
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -112,8 +118,19 @@ class GrokClient:
                 body: dict[str, Any] | str = response.json()
             except Exception:
                 body = response.text
+            elapsed = time.monotonic() - t0
             if raise_for_status:
                 response.raise_for_status()
+            LOGGER.info(
+                "Grok %s ← HTTP %s model=%s (%.1fs)",
+                op,
+                response.status_code,
+                model,
+                elapsed,
+            )
+            if response.status_code >= 400:
+                err = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)[:300]
+                LOGGER.warning("Grok %s error body: %s", op, err)
             return response.status_code, body
 
     def _chat_model_candidates(self) -> list[str]:
@@ -141,11 +158,15 @@ class GrokClient:
     async def refresh_chat_models(self) -> None:
         if not self.api_key:
             return
+        t0 = time.monotonic()
+        LOGGER.info("Grok GET /v1/models …")
         try:
             headers = {"Authorization": f"Bearer {self.api_key}"}
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.get(MODELS_LIST_URL, headers=headers)
+            elapsed = time.monotonic() - t0
             if response.status_code != 200:
+                LOGGER.warning("Grok models list HTTP %s (%.1fs)", response.status_code, elapsed)
                 return
             body = response.json()
             items = body.get("data") if isinstance(body, dict) else None
@@ -163,10 +184,20 @@ class GrokClient:
                     chat_models.append(model_id)
             if chat_models:
                 self._available_chat_models = chat_models
-                LOGGER.info("Grok chat models available: %s", ", ".join(chat_models[:8]))
+                LOGGER.info(
+                    "Grok chat models (%d, %.1fs): %s",
+                    len(chat_models),
+                    elapsed,
+                    ", ".join(chat_models[:8]),
+                )
             if image_models:
                 self._available_image_models = image_models
-                LOGGER.info("Grok image models available: %s", ", ".join(image_models[:8]))
+                LOGGER.info(
+                    "Grok image models (%d, %.1fs): %s",
+                    len(image_models),
+                    elapsed,
+                    ", ".join(image_models[:8]),
+                )
         except Exception as exc:
             LOGGER.debug("Grok models list failed: %s", exc)
 
@@ -189,7 +220,7 @@ class GrokClient:
                 "max_completion_tokens": max_tokens,
             }
             status, body = await self._post_json(
-                self.url, payload, timeout=timeout, raise_for_status=False
+                self.url, payload, timeout=timeout, raise_for_status=False, op="chat"
             )
             if status == 200 and isinstance(body, dict):
                 try:
@@ -294,6 +325,7 @@ class GrokClient:
         area = brief.get("total_area_m2") or "не указана"
         ptype = brief.get("project_type", "apartment")
         room_count = len(rooms)
+        LOGGER.info("Grok generate_layout: %d rooms, area=%s", room_count, area)
         system = (
             "Ты профессиональный архитектор-планировщик с 15-летним опытом жилых интерьеров. "
             "Отвечай ТОЛЬКО валидным JSON без markdown. "
@@ -316,6 +348,7 @@ class GrokClient:
             raw = await self.answer_text(prompt, system, max_tokens=900)
             layout = self._extract_json(raw)
             if layout.get("rooms"):
+                LOGGER.info("Grok layout ok: %d rooms", len(layout["rooms"]))
                 return layout
         except Exception as exc:
             LOGGER.warning("Grok layout failed: %s", exc)
@@ -362,7 +395,9 @@ class GrokClient:
             f"Опиши именно {name}, не путай с другими помещениями."
         )
         try:
-            return await self.answer_text(prompt, system, max_tokens=400)
+            text = await self.answer_text(prompt, system, max_tokens=400)
+            LOGGER.info("Grok describe_room ok: %s (%d chars)", name, len(text))
+            return text
         except Exception as exc:
             LOGGER.warning("Grok room description failed: %s", exc)
             return f"{name}: {style} интерьер, бюджет {budget}."
@@ -392,7 +427,9 @@ class GrokClient:
             "shows the SAME furniture in the SAME positions and colors."
         )
         try:
-            return await self.answer_vision(uri, prompt, system, max_tokens=500)
+            text = await self.answer_vision(uri, prompt, system, max_tokens=500)
+            LOGGER.info("Grok lock_design ok: %s (%d chars)", room_name, len(text))
+            return text
         except Exception as exc:
             LOGGER.warning("Design lock vision failed: %s", exc)
             return ""
@@ -514,6 +551,14 @@ class GrokClient:
     ) -> bytes | None:
         if not self.api_key:
             return None
+        room_name = room.get("name") or "room"
+        LOGGER.info(
+            "Grok generate_interior_image: room=%s view=%s (%d/%d)",
+            room_name,
+            view,
+            view_index,
+            views_total,
+        )
         prompt = self._interior_prompt(
             room,
             brief,
@@ -533,6 +578,7 @@ class GrokClient:
                         payload,
                         timeout=180,
                         raise_for_status=False,
+                        op=f"image/{view}",
                     )
                     if status == 200 and isinstance(body, dict):
                         image = await self._decode_image_response(body)
@@ -540,6 +586,11 @@ class GrokClient:
                             self._working_image_model = model
                             if model != self.image_model:
                                 LOGGER.info("Grok image ok with model %s", model)
+                            LOGGER.info(
+                                "Grok image generated view=%s size=%d bytes",
+                                view,
+                                len(image),
+                            )
                             return image
                     if status == 404:
                         self._blocked_image_models.add(model)

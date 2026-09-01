@@ -44,6 +44,13 @@ async def render_room_images(
     results: list[tuple[Path, str]] = []
     total = len(views)
     locked_layout = ""
+    LOGGER.info(
+        "render_room_images: %s index=%d views=%s palette=%d chars",
+        name,
+        room_index,
+        views,
+        len(design_palette),
+    )
 
     for vi, view in enumerate(views, start=1):
         view_label = VIEW_LABELS_RU.get(view, view)
@@ -52,6 +59,14 @@ async def render_room_images(
             f"Одна комната, та же расстановка мебели."
         )
         out_path = out_dir / f"room_{room_index}_{view}.jpg"
+        LOGGER.info(
+            "render_room_images: %s view %d/%d (%s) locked=%s",
+            name,
+            vi,
+            total,
+            view,
+            bool(locked_layout),
+        )
         image_bytes = await grok.generate_interior_image(
             room,
             brief,
@@ -66,8 +81,16 @@ async def render_room_images(
         if image_bytes:
             normalized = normalize_image_bytes(image_bytes)
             out_path.write_bytes(normalized)
+            LOGGER.info(
+                "render_room_images: %s view %s saved %d bytes → %s",
+                name,
+                view,
+                len(normalized),
+                out_path.name,
+            )
             results.append((out_path, caption))
             if vi == 1 and total > 1:
+                LOGGER.info("render_room_images: vision lock for %s", name)
                 locked_layout = await grok.lock_design_from_image(normalized, name)
                 if locked_layout:
                     LOGGER.info("Design locked for room %s (%d chars)", name, len(locked_layout))

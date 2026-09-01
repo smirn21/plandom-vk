@@ -1,11 +1,14 @@
 """Планировка: Grok + grid fallback."""
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any
 
 from core.models import ProjectBrief, ProjectType, RoomSpec, RoomType
 from grok_client import GrokClient
+
+LOGGER = logging.getLogger(__name__)
 
 
 def grid_layout(brief: ProjectBrief) -> dict[str, Any]:
@@ -69,12 +72,21 @@ def _merge_layout(brief: ProjectBrief, grok_rooms: list[dict[str, Any]]) -> dict
 
 
 async def build_layout(brief: ProjectBrief, grok: GrokClient | None) -> dict[str, Any]:
+    n = len(brief.rooms or [])
+    LOGGER.info("build_layout start: rooms=%d grok=%s", n, bool(grok and grok.available))
     data = brief.to_dict()
     if grok and grok.available:
         layout = await grok.generate_layout(data)
         grok_rooms = layout.get("rooms") or []
+        LOGGER.info("build_layout grok returned %d rooms", len(grok_rooms))
         if grok_rooms and brief.rooms:
-            return _merge_layout(brief, grok_rooms)
+            merged = _merge_layout(brief, grok_rooms)
+            LOGGER.info(
+                "build_layout merged: %s",
+                [r.get("name") for r in merged.get("rooms") or []],
+            )
+            return merged
+    LOGGER.info("build_layout fallback to grid (%d rooms)", n)
     return grid_layout(brief)
 
 

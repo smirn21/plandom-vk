@@ -70,6 +70,7 @@ def _vk_upload_error(up_data: dict[str, Any]) -> str | None:
 
 
 async def _post_multipart(upload_url: str, field: str, filename: str, data: bytes, mime: str) -> dict[str, Any]:
+    LOGGER.debug("VK multipart POST field=%s file=%s size=%d mime=%s", field, filename, len(data), mime)
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
         files = {field: (filename, data, mime)}
         up_resp = await client.post(upload_url, files=files)
@@ -143,14 +144,23 @@ async def upload_doc_to_messages(
     group_id: int | None = None,
     mime: str = "application/pdf",
 ) -> str | None:
+    LOGGER.info(
+        "VK doc upload start peer=%s title=%s size=%d bytes mime=%s",
+        peer_id,
+        title,
+        len(file_bytes),
+        mime,
+    )
     for attempt in range(1, 4):
         try:
             if attempt > 1:
+                LOGGER.info("VK doc upload retry %d/3 peer=%s", attempt, peer_id)
                 await asyncio.sleep(1.5 * attempt)
             upload_url = await _get_doc_upload_url(api, peer_id, group_id)
             if not upload_url:
                 LOGGER.warning("No doc upload_url for peer=%s", peer_id)
                 return None
+            LOGGER.debug("VK doc upload_url obtained (attempt %d)", attempt)
             up_data = await _post_multipart(upload_url, "file", title, file_bytes, mime)
             err = _vk_upload_error(up_data)
             if err:
@@ -160,9 +170,13 @@ async def upload_doc_to_messages(
             if not file_raw:
                 LOGGER.warning("Doc upload without file (attempt %s): %s", attempt, up_data)
                 continue
-            return await _save_doc(api, str(file_raw), title)
+            att = await _save_doc(api, str(file_raw), title)
+            if att:
+                LOGGER.info("VK doc upload ok peer=%s → %s (attempt %d)", peer_id, att, attempt)
+            return att
         except Exception as exc:
             LOGGER.warning("upload_doc attempt %s failed: %s", attempt, exc)
+    LOGGER.warning("VK doc upload failed after 3 attempts peer=%s title=%s", peer_id, title)
     return None
 
 
@@ -173,8 +187,10 @@ async def upload_photo_to_messages(
     *,
     group_id: int | None = None,
 ) -> str | None:
+    LOGGER.info("VK photo upload start peer=%s size=%d bytes", peer_id, len(image_bytes))
     try:
         for attempt, quality in enumerate((85, 75, 65), start=1):
+            LOGGER.info("VK photo attempt %d/3 quality=%d peer=%s", attempt, quality, peer_id)
             upload_url = await _get_messages_upload_url(api, peer_id, group_id)
             if not upload_url:
                 LOGGER.warning("No upload_url for peer=%s", peer_id)
@@ -182,6 +198,7 @@ async def upload_photo_to_messages(
             if attempt > 1:
                 await asyncio.sleep(0.8)
             jpeg = _jpeg_bytes(image_bytes, quality=quality)
+            LOGGER.debug("VK photo JPEG ready attempt=%d size=%d", attempt, len(jpeg))
             try:
                 up_data = await _post_multipart(upload_url, "photo", "photo.jpg", jpeg, "image/jpeg")
             except Exception as exc:
@@ -223,7 +240,9 @@ async def upload_photo_to_messages(
             att = f"photo{owner_id}_{photo_id}"
             if access_key:
                 att = f"{att}_{access_key}"
+            LOGGER.info("VK photo upload ok peer=%s → %s (attempt %d)", peer_id, att, attempt)
             return att
+        LOGGER.warning("VK photo upload failed after 3 attempts peer=%s", peer_id)
         return None
     except Exception as exc:
         LOGGER.warning("upload_photo failed: %s", exc)
@@ -260,10 +279,16 @@ async def upload_image_to_messages(
     doc_title: str = "plandom.jpg",
 ) -> str | None:
     """Сначала photo, при неудаче — doc."""
+    LOGGER.info("VK image upload peer=%s title=%s size=%d", peer_id, doc_title, len(image_bytes))
     att = await upload_photo_to_messages(api, peer_id, image_bytes, group_id=group_id)
     if att:
         return att
     LOGGER.info("Photo upload failed, trying doc fallback for %s", doc_title)
-    return await upload_image_as_doc(
+    doc_att = await upload_image_as_doc(
         api, peer_id, image_bytes, doc_title, group_id=group_id
     )
+    if doc_att:
+        LOGGER.info("VK doc fallback ok peer=%s → %s", peer_id, doc_att)
+    else:
+        LOGGER.warning("VK image upload failed (photo + doc) peer=%s title=%s", peer_id, doc_title)
+    return doc_att

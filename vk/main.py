@@ -21,6 +21,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+
+from vk.log_setup import configure_logging  # noqa: E402
+
+configure_logging()
 logger = logging.getLogger(__name__)
 
 from vk.http_fix import patch_vkbottle_pydantic  # noqa: E402

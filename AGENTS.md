@@ -28,6 +28,8 @@ python scripts/setup_vk_community.py  # оформление сообществ�
 | **`GROK_MODEL`** | **Chat** — планировка, описания (`grok-build-0.1`) |
 | **`GROK_IMAGE_MODEL`** | **Image** — интерьеры (`grok-imagine-image`) |
 | `YOOKASSA_*` | Оплата тарифов |
+| `PLANDOM_VERBOSE=1` | Подробные логи каждого шага (DEBUG для pipeline) |
+| `LOG_LEVEL` | Глобальный уровень: INFO (по умолчанию), DEBUG |
 
 **Важно:** `GROK_MODEL` и `GROK_IMAGE_MODEL` — разные API. Image-модель в `GROK_MODEL` ломает chat.
 
@@ -41,6 +43,7 @@ vk/handlers.py      → wizard, генерация, оплата
 vk/wizard_flow.py   → шаги мастера (площадь, комнаты, чертежи)
 vk/media.py         → загрузка фото/PDF в VK (photo + doc fallback)
 vk/progress.py      → статус генерации, typing, точки
+vk/log_setup.py     → configure_logging(), StepLog (пошаговые логи)
 vk/http_fix.py      → патч vkbottle+pydantic (Python 3.10)
 
 core/planner.py     → layout (Grok + grid fallback)
@@ -90,6 +93,25 @@ storage.py          → users, projects, payments
 - PDF/doc: 3 попытки, пауза 2с перед PDF, лог `error_descr`
 - На каждую попытку — **новый** upload URL
 - Пауза между загрузками ~0.8–1.5с
+
+## Логирование
+
+В `.env` для максимальной детализации:
+
+```env
+PLANDOM_VERBOSE=1
+LOG_LEVEL=DEBUG   # опционально
+```
+
+Формат: `время | уровень | модуль | сообщение`
+
+- **`vk/log_setup.py`** — `configure_logging()`, класс **`StepLog`** (`[gen:USER | шаг N | +сек]`)
+- **`vk/handlers.py`** — каждый этап генерации: layout, plan, describe, render, upload, PDF
+- **`grok_client.py`** — каждый API-запрос с таймингом (chat/image/vision)
+- **`vk/media.py`** — каждая попытка upload (photo/doc, retry)
+- **`core/planner.py`**, **`core/room_render.py`**, **`vk/progress.py`** — INFO на каждый шаг
+
+При `PLANDOM_VERBOSE=1` httpx/vkbottle приглушены до WARNING.
 
 ## Частые баги и fixes
 

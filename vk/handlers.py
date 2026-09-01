@@ -29,6 +29,7 @@ from storage import Storage
 from vk import keyboards
 from vk.attachments import save_message_attachments
 from vk.media import upload_doc_to_messages, upload_image_to_messages
+from vk.log_setup import StepLog
 from vk.progress import GenerationProgress
 from vk.wizard_flow import (
     apply_blueprint_to_wizard,
@@ -146,10 +147,19 @@ async def _run_generation(
 ) -> None:
     group_id = int(cfg["vk_group_id"])
     brief = brief_from_wizard(data)
+    step = StepLog(LOGGER, f"gen:{user_id[:8]}")
+    step.step(
+        "Старт: peer=%s type=%s комнат=%d",
+        peer_id,
+        brief.project_type.value,
+        len(brief.rooms or []),
+    )
     if not brief.rooms:
         if brief.project_type == ProjectType.SINGLE_ROOM:
             brief.rooms = [RoomSpec(name="Комната", room_type=RoomType.OTHER)]
+            step.step("Одна комната по умолчанию")
         else:
+            step.warn("Нет комнат — прерывание")
             await _send(api, peer_id, "Добавьте хотя бы одну комнату.", keyboards.rooms_keyboard(set()))
             return
 
@@ -158,6 +168,7 @@ async def _run_generation(
     out_dir = OUTPUT_ROOT / user_id / project_id
     out_dir.mkdir(parents=True, exist_ok=True)
     storage.create_project(project_id, user_id, brief.to_dict(), tier=tier, output_dir=str(out_dir))
+    step.step("Проект %s tier=%s dir=%s", project_id, tier, out_dir.name)
 
     progress = GenerationProgress(api, peer_id, group_id)
     await progress.start("⏳ Строю планировку", activity="typing")
@@ -166,28 +177,35 @@ async def _run_generation(
     pdf_path = out_dir / "project.pdf"
 
     try:
-        layout = await build_layout(brief, grok)
-        if brief.total_area_m2:
-            layout["total_area_m2"] = brief.total_area_m2
-        storage.update_project(project_id, layout=layout)
+        with step.phase("Планировка (build_layout)"):
+            layout = await build_layout(brief, grok)
+            if brief.total_area_m2:
+                layout["total_area_m2"] = brief.total_area_m2
+            storage.update_project(project_id, layout=layout)
+            step.debug("layout rooms: %s", [r.get("name") for r in layout.get("rooms") or []])
 
-        plan_path = layout_to_png(
-            layout,
-            out_dir / "plan.png",
-            estimated=bool(data.get("blueprint_estimated")),
-        )
+        with step.phase("PNG план (layout_to_png)"):
+            plan_path = layout_to_png(
+                layout,
+                out_dir / "plan.png",
+                estimated=bool(data.get("blueprint_estimated")),
+            )
+            step.debug("plan.png %d bytes", plan_path.stat().st_size)
 
         await progress.set_phase("📤 Загружаю план", activity="upload")
-        plan_att = await upload_image_to_messages(
-            api,
-            peer_id,
-            normalize_image_bytes(png_bytes(plan_path)),
-            group_id=group_id,
-            doc_title="plan.jpg",
-        )
+        with step.phase("Загрузка плана в VK"):
+            plan_att = await upload_image_to_messages(
+                api,
+                peer_id,
+                normalize_image_bytes(png_bytes(plan_path)),
+                group_id=group_id,
+                doc_title="plan.jpg",
+            )
         if plan_att:
+            step.step("План загружен: %s", plan_att)
             await _send_attachment(api, peer_id, "📐 Планировка квартиры", plan_att)
         else:
+            step.warn("Не удалось загрузить план в VK")
             upload_warnings.append("⚠️ Не удалось загрузить план в VK")
 
         is_full = tier in ("pro", "full")
@@ -198,9 +216,14 @@ async def _run_generation(
         total_rooms = len(rooms)
 
         await progress.set_phase("✍️ Описываю комнаты", activity="typing")
-        descriptions = list(
-            await asyncio.gather(*[grok.describe_room(room, brief_dict) for room in rooms])
-        )
+        with step.phase(f"Описания комнат (×{total_rooms}, параллельно)"):
+            descriptions = list(
+                await asyncio.gather(*[grok.describe_room(room, brief_dict) for room in rooms])
+            )
+            for i, room in enumerate(rooms):
+                name = room.get("name") or f"Комната {i + 1}"
+                desc_len = len(descriptions[i]) if i < len(descriptions) else 0
+                step.debug("describe %s: %d chars", name, desc_len)
 
         for i, room in enumerate(rooms):
             name = room.get("name") or f"Комната {i + 1}"
@@ -208,6 +231,14 @@ async def _run_generation(
             hd_room = tier in ("pro", "full") or (tier == "free" and i == 0)
             room_views = views_for_tier(tier, room_index=i, is_hd=hd_room)
 
+            step.step(
+                "Комната %d/%d «%s» hd=%s ракурсов=%d",
+                i + 1,
+                total_rooms,
+                name,
+                hd_room,
+                len(room_views),
+            )
             await progress.set_phase(
                 f"🎨 {name} ({i + 1}/{total_rooms}): генерирую интерьер",
                 activity="image",
@@ -219,16 +250,17 @@ async def _run_generation(
                 f"{'ракурс' if len(room_views) == 1 else 'ракурса'} одного интерьера",
             )
 
-            labeled_images = await render_room_images(
-                grok,
-                room,
-                brief_dict,
-                desc,
-                out_dir,
-                i + 1,
-                views=room_views,
-                design_palette=design_palette,
-            )
+            with step.phase(f"Рендер «{name}» ({len(room_views)} ракурса)"):
+                labeled_images = await render_room_images(
+                    grok,
+                    room,
+                    brief_dict,
+                    desc,
+                    out_dir,
+                    i + 1,
+                    views=room_views,
+                    design_palette=design_palette,
+                )
             room_uploaded = 0
             for card_path, caption in labeled_images:
                 if not hd_room:
@@ -236,6 +268,12 @@ async def _run_generation(
                 await progress.set_phase(
                     f"📤 {name}: загружаю фото ({room_uploaded + 1}/{len(labeled_images)})",
                     activity="upload",
+                )
+                step.debug(
+                    "upload %s (%d bytes) watermark=%s",
+                    card_path.name,
+                    card_path.stat().st_size,
+                    not hd_room,
                 )
                 att = await upload_image_to_messages(
                     api,
@@ -245,10 +283,11 @@ async def _run_generation(
                     doc_title=card_path.name,
                 )
                 if att:
+                    step.step("Фото «%s» → %s", name, att)
                     await _send_attachment(api, peer_id, caption, att)
                     room_uploaded += 1
                 else:
-                    LOGGER.warning("VK upload failed: room=%s file=%s", name, card_path.name)
+                    step.warn("VK upload failed: room=%s file=%s", name, card_path.name)
                 await asyncio.sleep(0.8)
             if labeled_images:
                 room_items_pdf.append((name, labeled_images[0][0], desc))
@@ -285,15 +324,20 @@ async def _run_generation(
 
         if include_pdf and room_items_pdf:
             await asyncio.sleep(2)
-            build_pdf(plan_path, room_items_pdf, pdf_path, title=f"ПланДом — {brief.project_type.value}")
-            pdf_att = await upload_doc_to_messages(
-                api, peer_id, pdf_path.read_bytes(), "plandom-project.pdf", group_id=group_id
-            )
+            with step.phase("PDF (build + upload)"):
+                build_pdf(plan_path, room_items_pdf, pdf_path, title=f"ПланДом — {brief.project_type.value}")
+                step.debug("project.pdf %d bytes", pdf_path.stat().st_size)
+                pdf_att = await upload_doc_to_messages(
+                    api, peer_id, pdf_path.read_bytes(), "plandom-project.pdf", group_id=group_id
+                )
             if pdf_att:
+                step.step("PDF загружен: %s", pdf_att)
                 msg_lines.append("📄 PDF прикреплён к сообщению.")
             else:
+                step.warn("Не удалось загрузить PDF в VK")
                 upload_warnings.append("⚠️ Не удалось загрузить PDF в VK")
         elif not include_pdf:
+            step.debug("PDF пропущен (tier=%s)", tier)
             msg_lines.append("📄 PDF доступен после оплаты полного проекта.")
 
         storage.update_project(project_id, status="done", tier=tier)
@@ -311,7 +355,12 @@ async def _run_generation(
                 "project_house" if brief.project_type == ProjectType.HOUSE else "project_apartment"
             )
             params["keyboard"] = keyboards.pay_keyboard(project_id, pay_type)
+        step.step("Финальное сообщение пользователю")
         await api.request("messages.send", params)
+        step.step("Генерация завершена project=%s", project_id)
+    except Exception:
+        step.step("Генерация прервана с ошибкой")
+        raise
     finally:
         await progress.stop()
 
@@ -871,6 +920,14 @@ def setup_handlers(bot, storage: Storage, grok: GrokClient, cfg: dict) -> None:
 
         if cmd == "generate":
             await ack()
+            rooms_n = len(data.get("rooms") or [])
+            LOGGER.info(
+                "Generate requested user=%s peer=%s rooms=%d style=%s",
+                user_id,
+                peer_id,
+                rooms_n,
+                data.get("style"),
+            )
 
             async def _safe_gen() -> None:
                 try:

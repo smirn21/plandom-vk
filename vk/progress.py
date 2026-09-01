@@ -34,16 +34,19 @@ class GenerationProgress:
         self._label = label
         self._activity = activity
         self._stop.clear()
+        LOGGER.info("Progress start peer=%s: %s (activity=%s)", self._peer_id, label, activity)
         await self._send_status()
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._loop())
 
     async def set_phase(self, label: str, *, activity: str = "typing") -> None:
+        LOGGER.info("Progress phase peer=%s: %s (activity=%s)", self._peer_id, label, activity)
         self._label = label
         self._activity = activity
         await self._send_status()
 
     async def stop(self) -> None:
+        LOGGER.info("Progress stop peer=%s: %s", self._peer_id, self._label)
         self._stop.set()
         if self._task and not self._task.done():
             self._task.cancel()
