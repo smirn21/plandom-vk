@@ -39,6 +39,7 @@ class YooKassaClient:
         payment_method: str | None = None,
         payment_method_id: str | None = None,
         save_payment_method: bool = False,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         """
         Create payment in YooKassa.
@@ -71,6 +72,8 @@ class YooKassaClient:
             metadata["subscription_type"] = subscription_type
         if package_type:
             metadata["package_type"] = package_type
+        if project_id:
+            metadata["project_id"] = project_id
 
         payload = {
             "amount": {
