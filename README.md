@@ -10,7 +10,7 @@
 ## Быстрый старт
 
 ```bash
-cd planirovka-vk
+cd plandom-vk
 cp .env.example .env   # VK_BOT_TOKEN, VK_GROUP_ID, GROK_API_KEY, YOOKASSA_*
 ./vk/run.sh
 ```
@@ -26,7 +26,7 @@ vk/.venv/bin/python -m vk.main
 ## Структура
 
 ```
-planirovka-vk/
+plandom-vk/
 ├── docs/           PRODUCT, ARCHITECTURE, MONETIZATION
 ├── vk/             бот VK (vkbottle)
 ├── core/           доменная логика: комнаты, план, генерация
