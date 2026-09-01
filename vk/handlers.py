@@ -44,6 +44,7 @@ ROOM_NAMES = {k: v for k, v in keyboards.ROOM_PRESETS}
 
 
 async def _send(api, peer_id: int, text: str, keyboard: str | None = None) -> None:
+    """Raw messages.send — обходит баг vkbottle+pydantic (MessagesSendPeerIdsResponse)."""
     params: dict = {
         "peer_id": int(peer_id),
         "message": text,
@@ -51,7 +52,16 @@ async def _send(api, peer_id: int, text: str, keyboard: str | None = None) -> No
     }
     if keyboard:
         params["keyboard"] = keyboard
-    await api.request("messages.send", params)
+    try:
+        await api.request("messages.send", params)
+    except Exception as exc:
+        err = str(exc).lower()
+        if keyboard and ("912" in err or "chat bot feature" in err):
+            LOGGER.warning("Клавиатура недоступна (912), отправляю текст без кнопок")
+            params.pop("keyboard", None)
+            await api.request("messages.send", params)
+            return
+        raise
 
 
 def _resolve_tier(storage: Storage, user_id: str, project_type: str) -> str:
@@ -95,6 +105,7 @@ async def _run_generation(
     peer_id: int,
     data: dict,
 ) -> None:
+    group_id = int(cfg["vk_group_id"])
     brief = brief_from_wizard(data)
     if not brief.rooms:
         if brief.project_type == ProjectType.SINGLE_ROOM:
@@ -116,7 +127,7 @@ async def _run_generation(
 
     plan_path = layout_to_png(layout, out_dir / "plan.png")
     attachments: list[str] = []
-    plan_att = await upload_photo_to_messages(api, peer_id, png_bytes(plan_path))
+    plan_att = await upload_photo_to_messages(api, peer_id, png_bytes(plan_path), group_id=group_id)
     if plan_att:
         attachments.append(plan_att)
 
@@ -135,7 +146,7 @@ async def _run_generation(
         else:
             free_hd_left -= 1
         room_items_pdf.append((name, card_path, desc))
-        att = await upload_photo_to_messages(api, peer_id, png_bytes(card_path))
+        att = await upload_photo_to_messages(api, peer_id, png_bytes(card_path), group_id=group_id)
         if att:
             attachments.append(att)
         await asyncio.sleep(0.4)
@@ -161,7 +172,9 @@ async def _run_generation(
 
     if include_pdf and room_items_pdf:
         build_pdf(plan_path, room_items_pdf, pdf_path, title=f"ПланДом — {brief.project_type.value}")
-        pdf_att = await upload_doc_to_messages(api, peer_id, pdf_path.read_bytes(), "plandom-project.pdf")
+        pdf_att = await upload_doc_to_messages(
+            api, peer_id, pdf_path.read_bytes(), "plandom-project.pdf", group_id=group_id
+        )
         if pdf_att:
             attachments.append(pdf_att)
             msg_lines.append("📄 PDF прикреплён к сообщению.")
@@ -213,16 +226,16 @@ def setup_handlers(bot, storage: Storage, grok: GrokClient, cfg: dict) -> None:
 
         if text.lower() in {"/start", "начать", "старт", "привет"}:
             storage.set_wizard(user_id, "type", {})
-            await message.answer(
+            await send(
                 WELCOME.replace("**", ""),
                 keyboard=keyboards.main_keyboard(is_admin=is_vk_admin(user_id, admin_ids)),
             )
-            await message.answer("Выберите тип объекта:", keyboard=keyboards.type_keyboard())
+            await send("Выберите тип объекта:", keyboard=keyboards.type_keyboard())
             return
 
         if text == "🏠 Новый проект":
             storage.set_wizard(user_id, "type", {})
-            await message.answer("Выберите тип объекта:", keyboard=keyboards.type_keyboard())
+            await send("Выберите тип объекта:", keyboard=keyboards.type_keyboard())
             return
 
         if text == "📊 Мой статус":
@@ -243,7 +256,7 @@ def setup_handlers(bot, storage: Storage, grok: GrokClient, cfg: dict) -> None:
                 f"PRO-проектов в месяц: {remaining}/3" if pro else "",
                 f"Бесплатный пробный: {'использован' if free_used else 'доступен'}",
             ]
-            await message.answer(
+            await send(
                 "\n".join(x for x in lines if x),
                 keyboard=keyboards.status_keyboard(pro, payments_ok),
             )
@@ -257,7 +270,7 @@ def setup_handlers(bot, storage: Storage, grok: GrokClient, cfg: dict) -> None:
                 f"• PRO: {PRICES['subscription']:.0f} ₽/мес (3 проекта)",
                 f"• Доп. стиль/комната: {PRICES['addon_style']:.0f} ₽",
             ]
-            await message.answer("\n".join(lines), keyboard=keyboards.tariffs_keyboard(payments_ok))
+            await send("\n".join(lines), keyboard=keyboards.tariffs_keyboard(payments_ok))
             return
 
         if text == "🔧 Админ панель":
@@ -270,7 +283,7 @@ def setup_handlers(bot, storage: Storage, grok: GrokClient, cfg: dict) -> None:
             return
 
         if text == "❓ Помощь":
-            await message.answer(
+            await send(
                 "ПланДом помогает спланировать квартиру или дом и показать обстановку по комнатам.\n\n"
                 "1. «Новый проект» → wizard\n"
                 "2. Получите PNG в чат\n"
@@ -285,10 +298,10 @@ def setup_handlers(bot, storage: Storage, grok: GrokClient, cfg: dict) -> None:
             try:
                 data["total_area_m2"] = float(text.replace(",", "."))
             except ValueError:
-                await message.answer("Введите число, например 65")
+                await send("Введите число, например 65")
                 return
             storage.set_wizard(user_id, "rooms", data)
-            await message.answer(
+            await send(
                 "Отметьте комнаты (можно несколько):",
                 keyboard=keyboards.rooms_keyboard(set()),
             )
@@ -298,10 +311,10 @@ def setup_handlers(bot, storage: Storage, grok: GrokClient, cfg: dict) -> None:
             data.setdefault("rooms", [])
             data["rooms"] = [{"name": text[:40], "room_type": "other"}]
             storage.set_wizard(user_id, "style", data)
-            await message.answer("Выберите стиль:", keyboard=keyboards.style_keyboard())
+            await send("Выберите стиль:", keyboard=keyboards.style_keyboard())
             return
 
-        await message.answer("Используйте меню 👇", keyboard=keyboards.main_keyboard(is_admin=is_vk_admin(user_id, admin_ids)))
+        await send("Используйте меню 👇", keyboard=keyboards.main_keyboard(is_admin=is_vk_admin(user_id, admin_ids)))
 
     @bot.on.raw_event(GroupEventType.MESSAGE_EVENT, dataclass=MessageEvent)
     async def on_callback(event: MessageEvent) -> None:

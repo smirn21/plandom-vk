@@ -154,7 +154,14 @@ def main() -> None:
 
     api(token, "groups.edit", group_id=gid, description=desc, website="https://github.com/smirn21/plandom-vk")
     try:
-        api(token, "groups.setSettings", group_id=gid, messages=1, bots_enabled=1)
+        api(
+            token,
+            "groups.setSettings",
+            group_id=gid,
+            messages=1,
+            bots_enabled=1,
+            bots_capabilities=1,
+        )
     except Exception as exc:
         print("groups.setSettings:", exc)
 
